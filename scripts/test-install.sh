@@ -14,7 +14,7 @@ for deb in "${CORE_DEB}" "${BRAIN_DEB}"; do
   fi
 done
 
-echo "==> Testing ${CORE_DEB} + ${BRAIN_DEB} in Docker (ubuntu:24.04)"
+echo "==> Testing ruOS packages in Docker container"
 
 CONTAINER="ruvultra-test-install-$$"
 
