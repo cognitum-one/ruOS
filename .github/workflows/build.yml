@@ -1,0 +1,46 @@
+name: Build & Package
+
+on: [push, pull_request]
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build amd64
+        run: make amd64
+      - name: Package .deb (amd64)
+        run: make deb-amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ruvultra-core-amd64
+          path: out/deb/*.deb
+
+  build-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cross
+        run: cargo install cross
+      - name: Build arm64
+        run: make arm64
+      - name: Package .deb (arm64)
+        run: make deb-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ruvultra-core-arm64
+          path: out/deb/*.deb
+
+  test-install:
+    needs: [build-amd64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ruvultra-core-amd64
+          path: out/deb/
+      - name: Test .deb installation
+        run: bash scripts/test-install.sh

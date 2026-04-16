@@ -1,0 +1,6 @@
+FROM ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main
+
+# Additional dependencies for ruvultra crates (if needed)
+RUN apt-get update -qq && apt-get install -y -qq \
+    libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*

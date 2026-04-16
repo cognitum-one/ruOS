@@ -1,0 +1,11 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y \
+    sqlite3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY out/deb/*.deb /tmp/
+RUN dpkg -i /tmp/*.deb || apt-get install -f -y
+
+CMD ["ruvultra-mcp", "--help"]
