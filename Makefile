@@ -5,7 +5,7 @@ CRATE_BASE := /home/ruvultra/projects/ruvultra-cognitum/crates
 OUTDIR := /home/ruvultra/projects/ruVultra-linux/out
 SCRIPTS := /home/ruvultra/projects/ruVultra-linux/scripts
 
-.PHONY: all amd64 arm64 deb deb-amd64 deb-arm64 clean
+.PHONY: all amd64 arm64 deb deb-amd64 deb-arm64 deb-brain deb-embedder clean test-docker test-arm64 release
 
 all: amd64 arm64
 
@@ -36,6 +36,20 @@ deb-arm64: arm64
 	$(SCRIPTS)/build-deb.sh arm64
 
 deb: deb-amd64 deb-arm64
+
+deb-brain:
+	$(SCRIPTS)/build-brain-deb.sh
+
+deb-embedder:
+	$(SCRIPTS)/build-embedder-deb.sh
+
+test-docker: deb-amd64 deb-brain
+	$(SCRIPTS)/test-install.sh
+
+test-arm64: deb-arm64
+	$(SCRIPTS)/test-arm64-qemu.sh
+
+release: deb deb-brain deb-embedder test-docker test-arm64
 
 clean:
 	rm -rf $(OUTDIR)

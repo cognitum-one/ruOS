@@ -1,25 +1,86 @@
-# ruVultra Linux Distribution Build Pipeline
+# ruVultra Linux Distribution v1.0
 
-Cross-compile and `.deb` packaging pipeline for the ruvultra Linux distribution.
+Cross-compile and `.deb` packaging pipeline for the ruvultra AI workstation.
 
-**Targets:** amd64 (native) + arm64 (cross-compile for Pi/Jetson)
+**Targets:** amd64 (native x86-64) + arm64 (Pi/Jetson cross-compile)
 
-## Crates
+## Packages
 
-| Crate | Description | Arch |
-|-------|-------------|------|
-| `ruvultra-mcp` | 99-tool MCP server | amd64, arm64 |
-| `ruvultra-profile` | System profile helper | amd64, arm64 |
-| `ruvultra-embedder` | CUDA embedder | amd64 only (GPU) |
+| Package | Arch | Size | Contents |
+|---------|------|------|----------|
+| `ruvultra-core` | amd64 | ~4 MB | ruvultra-mcp, ruvultra-profile, mcp-brain-server-local, mcp-brain, ruvultra-init, profiles, systemd units |
+| `ruvultra-core` | arm64 | ~850 KB | ruvultra-mcp, ruvultra-profile, ruvultra-init, profiles, systemd units |
+| `ruvultra-brain-base` | all | ~360 KB | Pre-seeded brain.rvf with 50 curated memories |
+| `ruvultra-embedder` | amd64 | ~67 MB | ruvultra-embedder binary + bge-small-en-v1.5 model weights |
+
+## Components
+
+| Binary | Description | Arch |
+|--------|-------------|------|
+| `ruvultra-mcp` | 99-tool MCP server (JSON-RPC 2.0 over stdio) | amd64, arm64 |
+| `ruvultra-profile` | System profile helper (sysctl, GPU, scheduler) | amd64, arm64 |
+| `ruvultra-init` | Hardware detection and system initialization | amd64, arm64 |
+| `mcp-brain-server-local` | Local brain backend (SQLite + HNSW, port 9876) | amd64 only |
+| `mcp-brain` | 22-tool stdio MCP wrapper for brain operations | amd64 only |
+| `ruvultra-embedder` | Local GPU embedder (bge-small-en-v1.5, CUDA) | amd64 only |
 
 ## Quick Start
 
+### Full workstation (amd64 with GPU)
+
+```bash
+sudo dpkg -i ruvultra-core_0.7.0_amd64.deb
+sudo dpkg -i ruvultra-brain-base_0.7.0_all.deb
+sudo dpkg -i ruvultra-embedder_0.7.0_amd64.deb
+sudo apt-get install -f
+```
+
+### Headless server (amd64, no GPU embedder)
+
+```bash
+sudo dpkg -i ruvultra-core_0.7.0_amd64.deb
+sudo dpkg -i ruvultra-brain-base_0.7.0_all.deb
+sudo apt-get install -f
+```
+
+### Raspberry Pi / Jetson (arm64)
+
+```bash
+sudo dpkg -i ruvultra-core_0.7.0_arm64.deb
+sudo apt-get install -f
+```
+
+Note: arm64 does not include brain-server or mcp-brain binaries. Use a remote brain endpoint or install the brain-base package for offline reference.
+
+## Build
+
 ```bash
 make amd64          # native build
-make arm64          # cross-compile via `cross`
-make deb            # build .deb packages for both archs
-bash scripts/test-install.sh  # verify in Docker
+make arm64          # cross-compile via cross
+make deb            # package both arch .debs
+make deb-brain      # package base brain (requires running brain server)
+make deb-embedder   # package embedder (amd64 only)
+make release        # build everything + test
 ```
+
+## Test
+
+```bash
+make test-docker    # test amd64 install in Docker
+make test-arm64     # test arm64 install via QEMU emulation
+```
+
+## Brain Base Package
+
+The `ruvultra-brain-base` package contains 50 curated memories across five categories:
+
+- **architecture** (10): MCP server, brain backend, embedder, profiles, RVF format, contrastive learning
+- **operations** (10): GPU health, service management, backups, drift detection, training export
+- **troubleshooting** (10): brain offline, CUDA errors, profile failures, systemd issues
+- **optimization** (10): GPU persistence, BBR+fq, zram, THP, WAL checkpoint, clock locking
+- **contrastive** (10): DPO vs RLHF, preference pairs, hard negatives, InfoNCE, MicroLoRA
+
+On install, the base brain is copied to `~/brain-data/brain.rvf` if no existing brain is found.
 
 ## ADRs
 
