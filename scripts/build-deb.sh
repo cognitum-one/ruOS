@@ -3,7 +3,7 @@ set -eu
 
 ARCH="${1:?usage: build-deb.sh <amd64|arm64>}"
 VERSION="0.7.0"
-PKG="ruvultra-core"
+PKG="ruos-core"
 PROJDIR="/home/ruvultra/projects/ruVultra-linux"
 SRCDIR="/home/ruvultra/projects/ruvultra-cognitum"
 OUTDIR="${PROJDIR}/out"
@@ -82,7 +82,7 @@ if [ -d "${SRCDIR}/config/profiles" ]; then
 fi
 
 # Install systemd units
-for svc in ruvultra-brain.service ruvultra-embedder.service; do
+for svc in ruvultra-brain.service ruos-embedder.service; do
   if [ -f "${SRCDIR}/config/systemd/${svc}" ]; then
     cp "${SRCDIR}/config/systemd/${svc}" "${STAGE}/usr/lib/systemd/user/${svc}"
   fi
@@ -134,7 +134,7 @@ set -e
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user daemon-reload 2>/dev/null || true
 fi
-echo "ruvultra-core installed. Run 'ruvultra-mcp --help' to verify."
+echo "ruos-core installed. Run 'ruvultra-mcp --help' to verify."
 POSTINST
 chmod 755 "${STAGE}/DEBIAN/postinst"
 

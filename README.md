@@ -1,4 +1,4 @@
-# ruVultra Linux Distribution v1.0
+# ruOS
 
 Cross-compile and `.deb` packaging pipeline for the ruvultra AI workstation.
 
@@ -8,10 +8,10 @@ Cross-compile and `.deb` packaging pipeline for the ruvultra AI workstation.
 
 | Package | Arch | Size | Contents |
 |---------|------|------|----------|
-| `ruvultra-core` | amd64 | ~4 MB | ruvultra-mcp, ruvultra-profile, mcp-brain-server-local, mcp-brain, ruvultra-init, profiles, systemd units |
-| `ruvultra-core` | arm64 | ~850 KB | ruvultra-mcp, ruvultra-profile, ruvultra-init, profiles, systemd units |
-| `ruvultra-brain-base` | all | ~360 KB | Pre-seeded brain.rvf with 50 curated memories |
-| `ruvultra-embedder` | amd64 | ~67 MB | ruvultra-embedder binary + bge-small-en-v1.5 model weights |
+| `ruos-core` | amd64 | ~4 MB | ruvultra-mcp, ruvultra-profile, mcp-brain-server-local, mcp-brain, ruvultra-init, profiles, systemd units |
+| `ruos-core` | arm64 | ~850 KB | ruvultra-mcp, ruvultra-profile, ruvultra-init, profiles, systemd units |
+| `ruos-brain-base` | all | ~360 KB | Pre-seeded brain.rvf with 50 curated memories |
+| `ruos-embedder` | amd64 | ~67 MB | ruos-embedder binary + bge-small-en-v1.5 model weights |
 
 ## Components
 
@@ -22,31 +22,31 @@ Cross-compile and `.deb` packaging pipeline for the ruvultra AI workstation.
 | `ruvultra-init` | Hardware detection and system initialization | amd64, arm64 |
 | `mcp-brain-server-local` | Local brain backend (SQLite + HNSW, port 9876) | amd64 only |
 | `mcp-brain` | 22-tool stdio MCP wrapper for brain operations | amd64 only |
-| `ruvultra-embedder` | Local GPU embedder (bge-small-en-v1.5, CUDA) | amd64 only |
+| `ruos-embedder` | Local GPU embedder (bge-small-en-v1.5, CUDA) | amd64 only |
 
 ## Quick Start
 
 ### Full workstation (amd64 with GPU)
 
 ```bash
-sudo dpkg -i ruvultra-core_0.7.0_amd64.deb
-sudo dpkg -i ruvultra-brain-base_0.7.0_all.deb
-sudo dpkg -i ruvultra-embedder_0.7.0_amd64.deb
+sudo dpkg -i ruos-core_0.7.0_amd64.deb
+sudo dpkg -i ruos-brain-base_0.7.0_all.deb
+sudo dpkg -i ruos-embedder_0.7.0_amd64.deb
 sudo apt-get install -f
 ```
 
 ### Headless server (amd64, no GPU embedder)
 
 ```bash
-sudo dpkg -i ruvultra-core_0.7.0_amd64.deb
-sudo dpkg -i ruvultra-brain-base_0.7.0_all.deb
+sudo dpkg -i ruos-core_0.7.0_amd64.deb
+sudo dpkg -i ruos-brain-base_0.7.0_all.deb
 sudo apt-get install -f
 ```
 
 ### Raspberry Pi / Jetson (arm64)
 
 ```bash
-sudo dpkg -i ruvultra-core_0.7.0_arm64.deb
+sudo dpkg -i ruos-core_0.7.0_arm64.deb
 sudo apt-get install -f
 ```
 
@@ -72,7 +72,7 @@ make test-arm64     # test arm64 install via QEMU emulation
 
 ## Brain Base Package
 
-The `ruvultra-brain-base` package contains 50 curated memories across five categories:
+The `ruos-brain-base` package contains 50 curated memories across five categories:
 
 - **architecture** (10): MCP server, brain backend, embedder, profiles, RVF format, contrastive learning
 - **operations** (10): GPU health, service management, backups, drift detection, training export

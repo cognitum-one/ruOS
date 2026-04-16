@@ -4,8 +4,8 @@ set -eu
 PROJDIR="/home/ruvultra/projects/ruVultra-linux"
 DEBDIR="${PROJDIR}/out/deb"
 ARCH="${1:-amd64}"
-CORE_DEB="ruvultra-core_0.7.0_${ARCH}.deb"
-BRAIN_DEB="ruvultra-brain-base_0.7.0_all.deb"
+CORE_DEB="ruos-core_0.7.0_${ARCH}.deb"
+BRAIN_DEB="ruos-brain-base_0.7.0_all.deb"
 
 for deb in "${CORE_DEB}" "${BRAIN_DEB}"; do
   if [ ! -f "${DEBDIR}/${deb}" ]; then

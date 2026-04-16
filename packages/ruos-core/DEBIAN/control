@@ -1,8 +1,8 @@
-Package: ruvultra-core
+Package: ruos-core
 Version: 0.7.0
 Architecture: amd64
 Maintainer: ruv <ruv@ruv.net>
-Description: ruvultra AI workstation core — MCP server, profile helper, brain backend
+Description: ruOS — ruvultra operating system core — MCP server, profile helper, brain backend
 Depends: sqlite3, ca-certificates
 Homepage: https://github.com/cognitum-one/ruVultra
 Section: utils

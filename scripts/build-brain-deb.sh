@@ -2,7 +2,7 @@
 set -eu
 
 VERSION="0.7.0"
-PKG="ruvultra-brain-base"
+PKG="ruos-brain-base"
 PROJDIR="/home/ruvultra/projects/ruVultra-linux"
 OUTDIR="${PROJDIR}/out"
 DEBDIR="${OUTDIR}/deb"
@@ -24,7 +24,7 @@ post_mem() {
 # --- architecture (10) ---
 post_mem "architecture" "ruvultra-mcp is a 102-tool MCP (Model Context Protocol) server that exposes system monitoring, GPU control, profile management, brain queries, and optimization tools to AI assistants over stdio JSON-RPC."
 post_mem "architecture" "The brain backend (mcp-brain-server-local) is a local HTTP server on port 9876 that stores and retrieves memories in a binary RVF (RuVultra Format) file backed by SQLite, with HNSW vector indexing for semantic search."
-post_mem "architecture" "The embedder (ruvultra-embedder) runs bge-small-en-v1.5 locally on the GPU via CUDA/cuDNN to generate 384-dimensional vector embeddings for brain memories, eliminating the need for cloud embedding APIs."
+post_mem "architecture" "The embedder (ruos-embedder) runs bge-small-en-v1.5 locally on the GPU via CUDA/cuDNN to generate 384-dimensional vector embeddings for brain memories, eliminating the need for cloud embedding APIs."
 post_mem "architecture" "The profile system (ruvultra-profile) applies predefined system configurations (sysctl, GPU clocks, scheduler, power) via TOML files in /etc/ruvultra-profiles/. Six profiles: default, gpu-train, gpu-infer, cpu-bulk, interactive, power-save."
 post_mem "architecture" "RVF (RuVultra Format) is the binary storage format for brain memories. It contains serialized memory records with content hashes, categories, timestamps, and optional vector embeddings. The file lives at ~/brain-data/brain.rvf."
 post_mem "architecture" "MCP (Model Context Protocol) is the JSON-RPC 2.0 protocol used to communicate between AI assistants (Claude, etc.) and ruvultra-mcp. Tools are registered via tools/list and invoked via tools/call over stdio."
@@ -35,7 +35,7 @@ post_mem "architecture" "Hard negatives are semantically similar but incorrect e
 
 # --- operations (10) ---
 post_mem "operations" "Check GPU health: run nvidia-smi to see temperature, utilization, memory, clocks, and power. The ruvultra-mcp tool ruv_gpu_status provides structured JSON output for programmatic access."
-post_mem "operations" "Restart services: systemctl --user restart ruvultra-brain ruvultra-embedder. Check status with systemctl --user status ruvultra-brain. Logs via journalctl --user -u ruvultra-brain -f."
+post_mem "operations" "Restart services: systemctl --user restart ruvultra-brain ruos-embedder. Check status with systemctl --user status ruvultra-brain. Logs via journalctl --user -u ruvultra-brain -f."
 post_mem "operations" "Apply a profile: sudo ruvultra-profile apply gpu-train. This reads /etc/ruvultra-profiles/gpu-train.toml and applies sysctl, GPU clock, scheduler, and power settings. Verify with ruvultra-profile current."
 post_mem "operations" "Run backups: cp ~/brain-data/brain.rvf ~/brain-data/brain.rvf.backup. For SQLite: sqlite3 ~/brain-data/brain.sqlite '.backup brain-backup.sqlite'. Schedule via cron or systemd timer."
 post_mem "operations" "Check drift: compare current sysctl/GPU settings against the active profile TOML. ruvultra-profile drift shows parameters that have changed since the profile was applied."
@@ -43,7 +43,7 @@ post_mem "operations" "Export training data: curl http://127.0.0.1:9876/memories
 post_mem "operations" "USB installer: flash the ruvultra ISO to USB with dd or Ventoy. Boot the target machine from USB, run ruvultra-init setup to configure the system with optimal defaults for the detected hardware."
 post_mem "operations" "Connect via Tailscale: tailscale up --hostname ruvultra-workstation. Access remotely with tailscale ip -4. The MCP server can be exposed over Tailscale for remote AI assistant access."
 post_mem "operations" "Monitor with the loop: use the ruvultra-mcp monitoring tools in a watch loop. watch -n 5 'echo {\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1,\\\"method\\\":\\\"tools/call\\\",\\\"params\\\":{\\\"name\\\":\\\"ruv_gpu_status\\\"}} | ruvultra-mcp'"
-post_mem "operations" "Update packages: apt update && apt upgrade ruvultra-core ruvultra-brain-base. Pin version with apt-mark hold ruvultra-core to prevent unwanted upgrades during training runs."
+post_mem "operations" "Update packages: apt update && apt upgrade ruos-core ruos-brain-base. Pin version with apt-mark hold ruos-core to prevent unwanted upgrades during training runs."
 
 # --- troubleshooting (10) ---
 post_mem "troubleshooting" "Brain offline fix: check if mcp-brain-server-local is running (pgrep mcp-brain-server). If not, start it: mcp-brain-server-local --port 9876 --data-dir ~/brain-data. Check port conflicts with ss -tlnp | grep 9876."
@@ -106,7 +106,7 @@ Version: ${VERSION}
 Architecture: all
 Maintainer: ruv <ruv@ruv.net>
 Description: ruvultra pre-trained brain with 50 curated base memories
-Depends: ruvultra-core
+Depends: ruos-core
 Homepage: https://github.com/cognitum-one/ruVultra
 Section: utils
 Priority: optional
@@ -124,9 +124,9 @@ BASE="/usr/share/ruvultra/brain-base.rvf"
 if [ ! -f "${BRAIN_FILE}" ]; then
   mkdir -p "${BRAIN_DIR}"
   cp "${BASE}" "${BRAIN_FILE}"
-  echo "ruvultra-brain-base: installed base brain to ${BRAIN_FILE}"
+  echo "ruos-brain-base: installed base brain to ${BRAIN_FILE}"
 else
-  echo "ruvultra-brain-base: existing brain found at ${BRAIN_FILE}, not overwriting"
+  echo "ruos-brain-base: existing brain found at ${BRAIN_FILE}, not overwriting"
   echo "  To reset: cp ${BASE} ${BRAIN_FILE}"
 fi
 POSTINST

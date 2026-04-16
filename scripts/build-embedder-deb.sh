@@ -2,7 +2,7 @@
 set -eu
 
 VERSION="0.7.0"
-PKG="ruvultra-embedder"
+PKG="ruos-embedder"
 PROJDIR="/home/ruvultra/projects/ruVultra-linux"
 OUTDIR="${PROJDIR}/out"
 DEBDIR="${OUTDIR}/deb"
@@ -44,7 +44,7 @@ Version: ${VERSION}
 Architecture: amd64
 Maintainer: ruv <ruv@ruv.net>
 Description: ruvultra local GPU embedder with bge-small-en-v1.5 model weights
-Depends: ruvultra-core
+Depends: ruos-core
 Homepage: https://github.com/cognitum-one/ruVultra
 Section: utils
 Priority: optional
@@ -62,9 +62,9 @@ MODEL_DST="${CACHE_DIR}/models--BAAI--bge-small-en-v1.5"
 if [ ! -e "${MODEL_DST}" ]; then
   mkdir -p "${CACHE_DIR}"
   ln -sf "${MODEL_SRC}" "${MODEL_DST}"
-  echo "ruvultra-embedder: linked model cache to ${MODEL_DST}"
+  echo "ruos-embedder: linked model cache to ${MODEL_DST}"
 else
-  echo "ruvultra-embedder: model cache already exists at ${MODEL_DST}"
+  echo "ruos-embedder: model cache already exists at ${MODEL_DST}"
 fi
 POSTINST
 chmod 755 "${STAGE}/DEBIAN/postinst"

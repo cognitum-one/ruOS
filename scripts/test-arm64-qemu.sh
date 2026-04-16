@@ -3,7 +3,7 @@ set -eu
 
 PROJDIR="/home/ruvultra/projects/ruVultra-linux"
 DEBDIR="${PROJDIR}/out/deb"
-DEB="ruvultra-core_0.7.0_arm64.deb"
+DEB="ruos-core_0.7.0_arm64.deb"
 
 if [ ! -f "${DEBDIR}/${DEB}" ]; then
   echo "ERROR: ${DEBDIR}/${DEB} not found — run 'make deb-arm64' first" >&2
@@ -23,7 +23,7 @@ RESULT=$(docker run --rm --platform linux/arm64 \
   ubuntu:24.04 sh -c '
   apt-get update -qq >/dev/null 2>&1
   apt-get install -y -qq sqlite3 ca-certificates >/dev/null 2>&1
-  dpkg -i /debs/ruvultra-core_0.7.0_arm64.deb 2>/dev/null
+  dpkg -i /debs/ruos-core_0.7.0_arm64.deb 2>/dev/null
 
   echo "--- Binary check ---"
   test -f /usr/local/bin/ruvultra-mcp && echo "ruvultra-mcp: OK"
