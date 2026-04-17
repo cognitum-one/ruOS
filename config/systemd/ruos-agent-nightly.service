@@ -1,0 +1,15 @@
+[Unit]
+Description=ruos-agent nightly — export pairs + DPO training + self-eval
+After=ruvultra-brain.service ruvultra-embedder.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '\
+  curl -s -X POST http://127.0.0.1:9876/brain/checkpoint && \
+  curl -s "http://127.0.0.1:9876/brain/export-pairs?format=jsonl&limit=10000" > /home/ruvultra/brain-data/training/pairs-$(date +%%Y%%m%%d).jsonl && \
+  /home/ruvultra/.local/bin/ruos-agent --train && \
+  /home/ruvultra/.local/bin/ruos-agent --backfill && \
+  /home/ruvultra/.local/bin/ruos-agent --eval'
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=600

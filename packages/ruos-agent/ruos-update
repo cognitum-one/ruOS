@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ruos-update — OTA update for ruOS
+# Downloads latest release from GitHub, installs new binaries, restarts services.
+#
+# Usage:
+#   ruos-update                 # check + update if available
+#   ruos-update --check         # just check, don't install
+#   ruos-update --force         # install even if same version
+#   ruos-update --channel edge  # use pre-release builds
+
+REPO="cognitum-one/ruVultra-linux"
+ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+STATE_DIR="$HOME/.local/state/ruos-agent"
+VERSION_FILE="$STATE_DIR/installed_version"
+UPDATE_LOG="$STATE_DIR/update.log"
+
+CHANNEL="${2:-stable}"
+CHECK_ONLY=false
+FORCE=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check) CHECK_ONLY=true; shift ;;
+        --force) FORCE=true; shift ;;
+        --channel) CHANNEL="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+mkdir -p "$STATE_DIR"
+
+log() {
+    echo "[$(date -Iseconds)] $*" | tee -a "$UPDATE_LOG"
+}
+
+current_version() {
+    cat "$VERSION_FILE" 2>/dev/null || echo "unknown"
+}
+
+latest_release() {
+    local flags=""
+    if [ "$CHANNEL" = "edge" ]; then
+        flags=""  # include pre-releases
+    fi
+
+    if command -v gh >/dev/null 2>&1; then
+        gh release view --repo "$REPO" --json tagName,publishedAt,assets -q '.tagName' 2>/dev/null
+    elif command -v curl >/dev/null 2>&1; then
+        curl -s "https://api.github.com/repos/$REPO/releases/latest" | \
+            python3 -c "import json,sys; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null
+    else
+        echo ""
+    fi
+}
+
+download_and_install() {
+    local version="$1"
+    local tmpdir=$(mktemp -d)
+
+    log "UPDATE: downloading ruos-core_*_${ARCH}.deb from $version"
+
+    # Download via gh CLI (handles auth + redirects)
+    if command -v gh >/dev/null 2>&1; then
+        gh release download "$version" --repo "$REPO" \
+            --pattern "ruos-core_*_${ARCH}.deb" \
+            --dir "$tmpdir" 2>/dev/null
+
+        # Also grab brain base if available
+        gh release download "$version" --repo "$REPO" \
+            --pattern "ruos-brain-base_*.deb" \
+            --dir "$tmpdir" 2>/dev/null || true
+    else
+        log "ERROR: gh CLI not available for download"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # Count downloaded files
+    local count=$(ls "$tmpdir"/*.deb 2>/dev/null | wc -l)
+    if [ "$count" -eq 0 ]; then
+        log "ERROR: no .deb files downloaded"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    log "UPDATE: installing $count packages"
+
+    # Stop services before updating binaries
+    systemctl --user stop ruvultra-brain.service ruvultra-embedder.service 2>/dev/null || true
+    sleep 1
+
+    # Install
+    sudo dpkg -i "$tmpdir"/*.deb 2>&1 | tee -a "$UPDATE_LOG"
+
+    # Restart services
+    systemctl --user start ruvultra-brain.service ruvultra-embedder.service 2>/dev/null || true
+
+    # Record version
+    echo "$version" > "$VERSION_FILE"
+
+    # Cleanup
+    rm -rf "$tmpdir"
+
+    log "UPDATE: installed $version successfully"
+
+    # Store in brain
+    curl -s -X POST http://127.0.0.1:9876/memories \
+        -H "Content-Type: application/json" \
+        -d "{\"category\":\"system-update\",\"content\":\"OTA update to $version completed at $(date -Iseconds)\"}" \
+        >/dev/null 2>&1 || true
+
+    return 0
+}
+
+# Main
+log "=== ruos-update check ==="
+
+CURRENT=$(current_version)
+LATEST=$(latest_release)
+
+if [ -z "$LATEST" ]; then
+    log "ERROR: could not determine latest release"
+    exit 1
+fi
+
+log "  Current: $CURRENT"
+log "  Latest:  $LATEST"
+
+if [ "$CURRENT" = "$LATEST" ] && [ "$FORCE" != "true" ]; then
+    log "  Already up to date"
+    exit 0
+fi
+
+if [ "$CHECK_ONLY" = "true" ]; then
+    if [ "$CURRENT" != "$LATEST" ]; then
+        echo "Update available: $CURRENT → $LATEST"
+        exit 0
+    fi
+    echo "Up to date: $CURRENT"
+    exit 0
+fi
+
+log "UPDATE: $CURRENT → $LATEST"
+download_and_install "$LATEST"

@@ -1,0 +1,16 @@
+[Unit]
+Description=ruos-llm-serve — local Qwen2.5-3B inference for agent reasoning
+After=ruvultra-brain.service ruvultra-embedder.service
+
+[Service]
+Type=simple
+ExecStart=/home/ruvultra/.local/bin/ruos-llm-serve --model Qwen/Qwen2.5-3B-Instruct --port 8080
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=30
+MemoryHigh=8G
+MemoryMax=12G
+
+[Install]
+WantedBy=default.target

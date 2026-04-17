@@ -1,0 +1,814 @@
+#!/usr/bin/env python3
+"""ruos-agent — the agentic heartbeat of ruOS.
+
+A single daemon that observes the system, makes decisions, and acts
+autonomously. Runs as a systemd timer (every 5 min) or as a oneshot.
+
+Capabilities:
+  1. Self-monitor   — restart crashed services, alert on failures
+  2. Auto-profile   — detect workload + presence, switch profiles
+  3. Embed backfill  — vectorize unembedded memories during idle
+  4. Nightly train   — DPO fine-tuning on accumulated preference pairs
+  5. Sensor context  — map ESP32 presence → profile decisions
+  6. Self-eval       — measure search quality drift
+  7. Session distill — (called by Claude Code post-session hook)
+
+Usage:
+  ruos-agent                    # full agentic loop
+  ruos-agent --monitor-only     # just health checks + restarts
+  ruos-agent --train            # force DPO training now
+  ruos-agent --backfill         # force embedding backfill now
+  ruos-agent --eval             # run self-evaluation
+  ruos-agent --status           # report agent state
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta
+from pathlib import Path
+
+BRAIN_URL = "http://127.0.0.1:9876"
+EMBEDDER_URL = "http://127.0.0.1:9877"
+RUVLLM_URL = "http://127.0.0.1:8080"
+STATE_DIR = Path.home() / ".local" / "state" / "ruos-agent"
+LOG_FILE = STATE_DIR / "agent.log"
+TRAIN_SCRIPT = Path.home() / "brain-data" / "training" / "train_dpo.py"
+RUVLLM_BIN = Path.home() / ".local" / "bin" / "ruvllm"
+RUVLLM_MODEL = "Qwen/Qwen2.5-3B-Instruct"  # 3B, full weights in HF cache
+ML_ENV = Path.home() / "ml-env" / "bin" / "activate"
+
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log(msg, level="INFO"):
+    ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    line = f"[{ts}] [{level}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def http_get(url, timeout=5):
+    try:
+        req = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def http_post(url, data, timeout=10):
+    try:
+        body = json.dumps(data).encode()
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def systemctl(action, unit):
+    try:
+        subprocess.run(["systemctl", "--user", action, unit],
+                       capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+
+def is_service_active(unit):
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", unit],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+# ─── 0. LLM Reasoning (ruvllm + Qwen/Phi) ────────────────────────────────────
+
+def _ruvllm_running():
+    """Check if ruvllm serve is up."""
+    return http_get(f"{RUVLLM_URL}/v1/models") is not None
+
+
+def _ensure_ruvllm():
+    """Start ruos-llm-serve if not already running."""
+    if _ruvllm_running():
+        return True
+
+    llm_serve = Path.home() / ".local" / "bin" / "ruos-llm-serve"
+    if not llm_serve.exists():
+        return False
+
+    log(f"RUVLLM: starting ruos-llm-serve (model={RUVLLM_MODEL})...")
+    try:
+        subprocess.Popen(
+            [str(llm_serve), "--model", RUVLLM_MODEL, "--port", "8080"],
+            stdout=subprocess.DEVNULL, stderr=open(str(LOG_FILE), "a"),
+        )
+        # Wait for model load (3B model takes ~10-30s on GPU)
+        for i in range(60):
+            time.sleep(1)
+            if _ruvllm_running():
+                log(f"RUVLLM: serve ready after {i+1}s (model={RUVLLM_MODEL})")
+                return True
+        log("RUVLLM: serve failed to start within 60s", "WARN")
+        return False
+    except Exception as e:
+        log(f"RUVLLM: could not start: {e}", "WARN")
+        return False
+
+
+def _brain_rag(query, k=3):
+    """Search brain for context relevant to the current observation."""
+    resp = http_post(f"{BRAIN_URL}/brain/search", {"query": query, "k": k})
+    if not resp or "results" not in resp:
+        return []
+    results = []
+    for r in resp["results"]:
+        content = r.get("content", "")
+        if content:
+            results.append({"category": r["category"], "content": content[:200],
+                           "score": round(r["score"], 3)})
+    return results
+
+
+def ruvllm_reason(observations):
+    """Use local LLM to reason about system state and decide actions.
+
+    Returns a dict with 'action', 'params', 'reasoning' or None if LLM unavailable.
+    """
+    if not _ensure_ruvllm():
+        return None
+
+    # Build RAG context from brain — query based on what's interesting
+    gpu_util = observations.get('gpu_util', 0)
+    if int(gpu_util) > 50:
+        rag_query = "GPU workload optimization inference training"
+    elif observations.get('sensor') == 'active':
+        rag_query = "system profile optimization workload management"
+    else:
+        rag_query = "system idle optimization power management profile"
+    rag_context = _brain_rag(rag_query)
+    rag_text = "\n".join(
+        f"- [{r['category']}] {r['content']}" for r in rag_context
+    ) if rag_context else "No relevant brain memories found."
+
+    # Build prompt
+    system_prompt = (
+        "You are ruos-agent, the reasoning engine of ruOS — an agentic operating system. "
+        "Given system observations and brain knowledge, decide what action to take. "
+        "Respond with ONLY a JSON object: {\"action\": \"...\", \"params\": {...}, \"reasoning\": \"...\"}\n\n"
+        "Available actions:\n"
+        "- switch_profile: params {\"name\": \"gpu-train|gpu-inference|cognitum-balanced|cognitum-idle\"}\n"
+        "- restart_service: params {\"name\": \"ruvultra-brain|ruvultra-embedder\"}\n"
+        "- run_backfill: params {\"count\": N} — embed unvectorized memories\n"
+        "- alert: params {\"message\": \"...\"} — log a warning\n"
+        "- no_action: params {} — system is healthy, do nothing\n"
+    )
+
+    user_prompt = (
+        f"## Current System State\n"
+        f"- GPU utilization: {observations.get('gpu_util', 'unknown')}%\n"
+        f"- GPU temperature: {observations.get('gpu_temp', 'unknown')}C\n"
+        f"- GPU processes: {observations.get('gpu_procs', 'none')}\n"
+        f"- Current profile: {observations.get('current_profile', 'unknown')}\n"
+        f"- Time: {datetime.now().strftime('%H:%M %A')}\n"
+        f"- Sensor: {observations.get('sensor', 'unknown')}\n"
+        f"- Memories: {observations.get('memory_count', '?')} total, "
+        f"{observations.get('unembedded', '?')} unembedded\n"
+        f"- Search quality: {observations.get('search_score', '?')}\n"
+        f"- Last profile switch: {observations.get('last_switch', 'unknown')}\n"
+        f"\n## Brain Knowledge (RAG)\n{rag_text}\n"
+        f"\n## Decide\nReturn only JSON."
+    )
+
+    body = {
+        "model": RUVLLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 256,
+    }
+
+    try:
+        resp = http_post(f"{RUVLLM_URL}/v1/chat/completions", body, timeout=30)
+        if not resp:
+            return None
+
+        content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+        # Extract JSON from response (model may wrap in markdown)
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        content = content.strip()
+
+        decision = json.loads(content)
+        log(f"RUVLLM: reason → action={decision.get('action')} "
+            f"reasoning={decision.get('reasoning', '')[:80]}")
+        _write_state("last_reasoning", {
+            "at": datetime.now().isoformat(),
+            "observations": {k: str(v)[:100] for k, v in observations.items()},
+            "decision": decision,
+            "rag_hits": len(rag_context),
+        })
+        return decision
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        log(f"RUVLLM: invalid response — {e}", "WARN")
+        return None
+    except Exception as e:
+        log(f"RUVLLM: reasoning failed — {e}", "WARN")
+        return None
+
+
+# ─── 1. Self-Monitor ─────────────────────────────────────────────────────────
+
+def self_monitor():
+    """Check all ruOS services, restart any that have failed."""
+    services = {
+        "ruvultra-brain.service": BRAIN_URL + "/health",
+        "ruvultra-embedder.service": EMBEDDER_URL + "/health",
+    }
+    issues = []
+    for unit, health_url in services.items():
+        active = is_service_active(unit)
+        healthy = http_get(health_url) is not None if active else False
+
+        if not active:
+            log(f"RESTART: {unit} is not active, restarting", "WARN")
+            systemctl("restart", unit)
+            time.sleep(2)
+            if is_service_active(unit):
+                log(f"RECOVERED: {unit} restarted successfully")
+            else:
+                log(f"FAILED: {unit} could not be restarted", "ERROR")
+                issues.append(f"{unit} down and unrecoverable")
+        elif not healthy:
+            log(f"UNHEALTHY: {unit} is active but health check failed, restarting", "WARN")
+            systemctl("restart", unit)
+            time.sleep(2)
+            issues.append(f"{unit} was unhealthy, restarted")
+
+    # Check GPU temperature
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        temp = int(r.stdout.strip())
+        if temp > 85:
+            log(f"GPU thermal warning: {temp}C — consider switching to cognitum-idle", "WARN")
+            issues.append(f"GPU at {temp}C")
+    except Exception:
+        pass
+
+    return issues
+
+
+# ─── 2. Auto-Profile ─────────────────────────────────────────────────────────
+
+def auto_profile():
+    """Detect workload and switch profile if appropriate."""
+    # Get current GPU utilization
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        parts = [x.strip() for x in r.stdout.strip().split(",")]
+        gpu_util = int(parts[0])
+        gpu_temp = int(parts[1])
+        gpu_power = float(parts[2])
+    except Exception:
+        return None
+
+    # Check what processes are running
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-compute-apps=process_name",
+                           "--format=csv,noheader"],
+                          capture_output=True, text=True, timeout=5)
+        gpu_procs = [p.strip() for p in r.stdout.strip().split("\n") if p.strip()]
+    except Exception:
+        gpu_procs = []
+
+    # Check hour of day for time-aware decisions
+    hour = datetime.now().hour
+    current_profile = _read_current_profile()
+    recommended = None
+    reasoning_source = "rules"
+
+    # Safety rules (always enforced, no LLM override)
+    if gpu_temp > 85:
+        recommended = "cognitum-idle"
+        reasoning_source = "safety-thermal"
+    else:
+        # Try LLM reasoning — but only every 3rd heartbeat or when state changed
+        last_switch = _read_state("last_profile_switch")
+        last_reasoning = _read_state("last_reasoning")
+        last_reason_gpu = int(last_reasoning.get("observations", {}).get("gpu_util", -1)) if last_reasoning else -1
+        state_changed = abs(gpu_util - last_reason_gpu) > 20 or gpu_temp > 75
+
+        # Rate-limit LLM: every 15 min unless state changed significantly
+        skip_llm = False
+        if last_reasoning and not state_changed:
+            try:
+                last_dt = datetime.fromisoformat(last_reasoning["at"])
+                if datetime.now() - last_dt < timedelta(minutes=15):
+                    skip_llm = True
+            except Exception:
+                pass
+
+        observations = {
+            "gpu_util": gpu_util, "gpu_temp": gpu_temp, "gpu_power": gpu_power,
+            "gpu_procs": ", ".join(gpu_procs) if gpu_procs else "none",
+            "current_profile": current_profile,
+            "sensor": sensor_context().get("sensor", "unknown"),
+            "memory_count": _get_memory_count(),
+            "unembedded": _get_unembedded_count(),
+            "search_score": _read_state("last_eval") and _read_state("last_eval").get("avg_top_score", "?") or "?",
+            "last_switch": last_switch.get("at", "unknown") if last_switch else "unknown",
+        }
+
+        decision = None if skip_llm else ruvllm_reason(observations)
+
+        if decision and decision.get("action") == "switch_profile":
+            params = decision.get("params", {})
+            name = params.get("name", "")
+            valid_profiles = {"gpu-train", "gpu-inference", "cognitum-balanced", "cognitum-idle"}
+            if name in valid_profiles:
+                recommended = name
+                reasoning_source = f"ruvllm: {decision.get('reasoning', '')[:60]}"
+            else:
+                log(f"RUVLLM: invalid profile '{name}', falling back to rules", "WARN")
+                decision = None
+
+        # Fallback to rules if LLM unavailable or returned no_action/invalid
+        if not decision or not recommended:
+            if any("python" in p.lower() or "train" in p.lower() for p in gpu_procs):
+                recommended = "gpu-train"
+            elif gpu_util > 80:
+                recommended = "gpu-inference"
+            elif gpu_util < 5 and gpu_temp < 50:
+                if 1 <= hour <= 6:
+                    recommended = "cognitum-idle"
+                else:
+                    recommended = "cognitum-balanced"
+            elif gpu_temp > 80:
+                recommended = "cognitum-idle"
+            reasoning_source = "rules" if recommended else "none"
+
+    if recommended and recommended != current_profile:
+        log(f"AUTO-PROFILE: {current_profile} → {recommended} "
+            f"(gpu={gpu_util}%, temp={gpu_temp}C, source={reasoning_source})")
+        try:
+            subprocess.run(
+                [str(Path.home() / ".local" / "bin" / "ruvultra-profile"),
+                 "apply", recommended],
+                capture_output=True, timeout=30
+            )
+            _write_state("last_profile_switch", {
+                "from": current_profile, "to": recommended,
+                "reason": f"gpu={gpu_util}% temp={gpu_temp}C hour={hour}",
+                "source": reasoning_source,
+                "at": datetime.now().isoformat(),
+            })
+        except Exception as e:
+            log(f"AUTO-PROFILE failed: {e}", "ERROR")
+
+    return {"gpu_util": gpu_util, "gpu_temp": gpu_temp, "profile": current_profile,
+            "recommended": recommended, "reasoning_source": reasoning_source}
+
+
+def _read_current_profile():
+    """Read the last applied profile from history.jsonl or agent state."""
+    # Try agent's own record first
+    last_switch = _read_state("last_profile_switch")
+    if last_switch and last_switch.get("to"):
+        return last_switch["to"]
+
+    # Fall back to ruvultra-profile history
+    history = Path.home() / ".local" / "state" / "ruvultra-profiles" / "history.jsonl"
+    try:
+        with open(history) as f:
+            lines = f.readlines()
+        for line in reversed(lines):
+            entry = json.loads(line.strip())
+            if entry.get("action") == "apply-success" and entry.get("profile_name"):
+                name = entry["profile_name"]
+                if name != "__rollback__":
+                    return name
+    except Exception:
+        pass
+
+    return "cognitum-balanced"  # sensible default
+
+
+def _get_memory_count():
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(Path.home() / "brain-data" / "brain.sqlite"))
+        count = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
+
+
+def _get_unembedded_count():
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(Path.home() / "brain-data" / "brain.sqlite"))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE LENGTH(embedding) = 0 OR embedding IS NULL"
+        ).fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
+
+
+# ─── 3. Embed Backfill ────────────────────────────────────────────────────────
+
+def embed_backfill(max_batch=50):
+    """Find memories without embeddings and vectorize them."""
+    import sqlite3
+    db_path = Path.home() / "brain-data" / "brain.sqlite"
+    blob_dir = Path.home() / "brain-data" / "blobs"
+
+    conn = sqlite3.connect(str(db_path))
+    rows = conn.execute(
+        "SELECT hex(id), content_hash FROM memories WHERE LENGTH(embedding) = 0 OR embedding IS NULL LIMIT ?",
+        (max_batch,)
+    ).fetchall()
+
+    if not rows:
+        log("BACKFILL: all memories have embeddings")
+        return 0
+
+    embedded = 0
+    for id_hex, content_hash in rows:
+        # Resolve content from blob
+        if len(content_hash) < 4:
+            continue
+        blob_path = blob_dir / content_hash[:2] / content_hash[2:]
+        if not blob_path.exists():
+            continue
+        content = blob_path.read_text()
+        if not content or len(content) < 3:
+            continue
+
+        # Get embedding
+        resp = http_post(f"{EMBEDDER_URL}/embed", {"texts": [content]})
+        if not resp:
+            continue
+        vectors = resp.get("vectors") or resp.get("embeddings")
+        if not vectors or not vectors[0]:
+            continue
+        vec = vectors[0]
+
+        # Write embedding back to SQLite
+        import struct
+        emb_blob = b"".join(struct.pack("<f", v) for v in vec)
+        id_blob = bytes.fromhex(id_hex)
+        conn.execute("UPDATE memories SET embedding = ? WHERE id = ?", (emb_blob, id_blob))
+        embedded += 1
+
+    conn.commit()
+    conn.close()
+
+    if embedded > 0:
+        log(f"BACKFILL: embedded {embedded}/{len(rows)} memories")
+        # Restart brain to rebuild index with new vectors
+        if embedded > 10:
+            systemctl("restart", "ruvultra-brain.service")
+            log("BACKFILL: restarted brain to rebuild vector index")
+
+    return embedded
+
+
+# ─── 4. Nightly Train ─────────────────────────────────────────────────────────
+
+def nightly_train():
+    """Run DPO training if we have enough new pairs since last training."""
+    last_train = _read_state("last_train")
+    if last_train:
+        last_dt = datetime.fromisoformat(last_train.get("at", "2000-01-01"))
+        if datetime.now() - last_dt < timedelta(hours=20):
+            log("TRAIN: skipping — last training was less than 20h ago")
+            return False
+
+    # Check if training data exists
+    training_dir = Path.home() / "brain-data" / "training"
+    pairs_files = sorted(training_dir.glob("pairs-*.jsonl"))
+    if not pairs_files:
+        log("TRAIN: no pairs files found")
+        return False
+
+    latest = pairs_files[-1]
+    line_count = sum(1 for _ in open(latest))
+    if line_count < 20:
+        log(f"TRAIN: only {line_count} pairs in {latest.name}, need at least 20")
+        return False
+
+    log(f"TRAIN: starting DPO training on {latest.name} ({line_count} pairs)")
+
+    try:
+        # Run training in the ml-env
+        cmd = f"source {ML_ENV} && python3 {TRAIN_SCRIPT} --pairs {latest}"
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=300)
+        if r.returncode == 0:
+            log("TRAIN: DPO training completed successfully")
+            _write_state("last_train", {
+                "at": datetime.now().isoformat(),
+                "pairs_file": str(latest),
+                "pairs_count": line_count,
+            })
+            return True
+        else:
+            log(f"TRAIN: failed — {r.stderr[-200:]}", "ERROR")
+            return False
+    except subprocess.TimeoutExpired:
+        log("TRAIN: timed out after 5 minutes", "ERROR")
+        return False
+
+
+# ─── 5. Sensor Context ───────────────────────────────────────────────────────
+
+def sensor_context():
+    """Check ESP32 presence data and adjust behavior."""
+    # Query recent sensor-csi memories
+    import sqlite3
+    db_path = Path.home() / "brain-data" / "brain.sqlite"
+    conn = sqlite3.connect(str(db_path))
+
+    recent = conn.execute(
+        "SELECT created_at FROM memories WHERE category = 'sensor-csi' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    if not recent:
+        return {"sensor": "no data"}
+
+    last_reading = recent[0]
+    age_sec = int(time.time()) - last_reading
+
+    if age_sec > 300:
+        # No sensor data for 5+ minutes — sensor may be offline
+        return {"sensor": "stale", "age_sec": age_sec}
+
+    # Sensor is live — presence is implied by data flow
+    # (Full CSI presence detection would parse amplitude thresholds)
+    return {"sensor": "active", "age_sec": age_sec, "presence": "detected"}
+
+
+# ─── 6. Self-Eval ────────────────────────────────────────────────────────────
+
+def self_eval():
+    """Test search quality and measure drift."""
+    test_queries = [
+        ("GPU optimization", "opt"),
+        ("system profile management", "profile"),
+        ("contrastive learning", "contrastive"),
+        ("brain memory storage", "brain"),
+    ]
+
+    results = []
+    for query, expected_cat_prefix in test_queries:
+        resp = http_post(f"{BRAIN_URL}/brain/search", {"query": query, "k": 3})
+        if not resp or "results" not in resp:
+            results.append({"query": query, "status": "search_failed"})
+            continue
+
+        hits = resp["results"]
+        top_score = hits[0]["score"] if hits else 0
+        has_content = any(h.get("content") for h in hits)
+        results.append({
+            "query": query,
+            "hits": len(hits),
+            "top_score": round(top_score, 4),
+            "has_content": has_content,
+        })
+
+    avg_score = sum(r.get("top_score", 0) for r in results) / max(len(results), 1)
+    eval_result = {
+        "at": datetime.now().isoformat(),
+        "queries": len(results),
+        "avg_top_score": round(avg_score, 4),
+        "details": results,
+    }
+
+    if avg_score < 0.3:
+        log(f"SELF-EVAL: search quality degraded — avg score {avg_score:.4f}", "WARN")
+    else:
+        log(f"SELF-EVAL: search quality OK — avg score {avg_score:.4f}")
+
+    _write_state("last_eval", eval_result)
+    return eval_result
+
+
+# ─── 7. Session Distill ──────────────────────────────────────────────────────
+
+def session_distill(summary, category="session-learning"):
+    """Store a Claude Code session insight as a brain memory."""
+    if not summary or len(summary) < 10:
+        return False
+
+    resp = http_post(f"{BRAIN_URL}/memories", {
+        "category": category,
+        "content": summary,
+    })
+    if resp and "id" in resp:
+        log(f"DISTILL: stored session learning → {resp['id'][:12]}")
+        return True
+    return False
+
+
+# ─── State helpers ────────────────────────────────────────────────────────────
+
+def _read_state(key):
+    path = STATE_DIR / f"{key}.json"
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _write_state(key, data):
+    path = STATE_DIR / f"{key}.json"
+    path.write_text(json.dumps(data, indent=2))
+
+
+# ─── Agent Loop ───────────────────────────────────────────────────────────────
+
+def agent_loop(args):
+    """The main agentic heartbeat."""
+    start = time.time()
+    log("=== ruos-agent heartbeat ===")
+
+    report = {"at": datetime.now().isoformat(), "actions": []}
+
+    # 1. Always: self-monitor
+    issues = self_monitor()
+    report["monitor"] = {"issues": issues}
+    if issues:
+        report["actions"].append(f"monitor: {', '.join(issues)}")
+
+    if args.monitor_only:
+        _write_state("last_run", report)
+        return report
+
+    # 2. Auto-profile (every run)
+    profile_state = auto_profile()
+    report["profile"] = profile_state
+    if profile_state and profile_state.get("recommended"):
+        report["actions"].append(f"profile: → {profile_state['recommended']}")
+
+    # 3. Sensor context
+    sensor = sensor_context()
+    report["sensor"] = sensor
+
+    # 4. Embed backfill (if GPU is idle)
+    if profile_state and profile_state.get("gpu_util", 100) < 30:
+        embedded = embed_backfill(max_batch=20)
+        report["backfill"] = embedded
+        if embedded:
+            report["actions"].append(f"backfill: embedded {embedded} memories")
+
+    # 5. Self-eval (once per hour)
+    last_eval = _read_state("last_eval")
+    run_eval = True
+    if last_eval:
+        try:
+            last_eval_dt = datetime.fromisoformat(last_eval["at"])
+            if datetime.now() - last_eval_dt < timedelta(hours=1):
+                run_eval = False
+        except Exception:
+            pass
+    if run_eval:
+        eval_result = self_eval()
+        report["eval"] = eval_result
+        report["actions"].append(f"eval: avg_score={eval_result['avg_top_score']}")
+
+    # 6. Nightly train (check conditions)
+    hour = datetime.now().hour
+    if 2 <= hour <= 5:  # Only attempt training during off-hours
+        trained = nightly_train()
+        if trained:
+            report["actions"].append("train: DPO training completed")
+
+    elapsed = time.time() - start
+    report["elapsed_sec"] = round(elapsed, 2)
+    log(f"=== heartbeat complete: {len(report['actions'])} actions in {elapsed:.1f}s ===")
+    _write_state("last_run", report)
+    return report
+
+
+def status_report():
+    """Print current agent state."""
+    print("ruos-agent status")
+    print("=" * 50)
+
+    last_run = _read_state("last_run")
+    if last_run:
+        print(f"  Last run: {last_run.get('at', 'unknown')}")
+        print(f"  Actions:  {last_run.get('actions', [])}")
+        print(f"  Elapsed:  {last_run.get('elapsed_sec', '?')}s")
+    else:
+        print("  No previous runs")
+
+    last_train = _read_state("last_train")
+    if last_train:
+        print(f"  Last train: {last_train.get('at', 'never')}")
+        print(f"  Pairs: {last_train.get('pairs_count', '?')}")
+
+    last_eval = _read_state("last_eval")
+    if last_eval:
+        print(f"  Last eval: {last_eval.get('at', 'never')}")
+        print(f"  Avg score: {last_eval.get('avg_top_score', '?')}")
+
+    last_switch = _read_state("last_profile_switch")
+    if last_switch:
+        print(f"  Last profile switch: {last_switch.get('from', '?')} → {last_switch.get('to', '?')}")
+        print(f"    Reason: {last_switch.get('reason', '?')}")
+        print(f"    At: {last_switch.get('at', '?')}")
+
+    # LLM reasoning
+    last_reasoning = _read_state("last_reasoning")
+    if last_reasoning:
+        d = last_reasoning.get("decision", {})
+        print(f"  Last reasoning: {last_reasoning.get('at', '?')}")
+        print(f"    Action: {d.get('action', '?')}")
+        print(f"    Reasoning: {d.get('reasoning', '?')[:80]}")
+        print(f"    RAG hits: {last_reasoning.get('rag_hits', 0)}")
+
+    # Live checks
+    print()
+    for name, url in [("brain", BRAIN_URL), ("embedder", EMBEDDER_URL)]:
+        h = http_get(f"{url}/health")
+        print(f"  {name}: {'OK' if h else 'DOWN'}")
+    ruvllm_up = _ruvllm_running()
+    print(f"  ruvllm: {'OK (model=' + RUVLLM_MODEL + ')' if ruvllm_up else 'NOT RUNNING'}")
+
+    # Vector coverage
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(Path.home() / "brain-data" / "brain.sqlite"))
+        total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        with_vec = conn.execute("SELECT COUNT(*) FROM memories WHERE LENGTH(embedding) > 0").fetchone()[0]
+        conn.close()
+        print(f"  Vectors: {with_vec}/{total} ({with_vec*100//total}%)")
+    except Exception:
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ruos-agent — agentic heartbeat")
+    parser.add_argument("--monitor-only", action="store_true", help="Only health checks")
+    parser.add_argument("--train", action="store_true", help="Force DPO training now")
+    parser.add_argument("--backfill", action="store_true", help="Force embedding backfill")
+    parser.add_argument("--eval", action="store_true", help="Run self-evaluation")
+    parser.add_argument("--distill", type=str, help="Store a session insight")
+    parser.add_argument("--status", action="store_true", help="Show agent state")
+    args = parser.parse_args()
+
+    if args.status:
+        status_report()
+        return
+
+    if args.distill:
+        session_distill(args.distill)
+        return
+
+    if args.train:
+        nightly_train()
+        return
+
+    if args.backfill:
+        embed_backfill(max_batch=100)
+        return
+
+    if args.eval:
+        result = self_eval()
+        print(json.dumps(result, indent=2))
+        return
+
+    agent_loop(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+[Unit]
+Description=ruos-update — OTA update check
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/ruvultra/.local/bin/ruos-update --check
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=120
