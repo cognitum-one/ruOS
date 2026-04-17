@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION="0.7.0"
+VERSION="1.1.0"
 PKG="ruos-embedder-intel"
 ARCH="all"
 DEB_DIR="$(cd "$(dirname "$0")/.." && pwd)/out/deb"
