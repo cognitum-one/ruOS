@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""ruvultra-embedder-intel — OpenVINO embedding service for Intel hardware.
+
+Drop-in replacement for the CUDA embedder. Same API (POST /embed, GET /health),
+same model (bge-small-en-v1.5, 384-d), but uses OpenVINO for inference on:
+  - Intel CPU (AVX-512, AMX on Xeon)
+  - Intel Arc GPU (xe driver)
+  - Intel iGPU (integrated graphics)
+
+Usage:
+  ruvultra-embedder-intel                      # auto-detect best device
+  ruvultra-embedder-intel --device CPU         # force CPU
+  ruvultra-embedder-intel --device GPU         # force Intel Arc/iGPU
+  ruvultra-embedder-intel --port 9877          # custom port
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+
+MODEL_NAME = "bge-small-en-v1.5"
+DIM = 384
+MAX_BATCH = 64
+BIND = "127.0.0.1"
+
+# Lazy-loaded globals
+_model = None
+_tokenizer = None
+_device = None
+
+
+def load_model(device="AUTO"):
+    """Load bge-small-en-v1.5 via OpenVINO optimum or ONNX Runtime."""
+    global _model, _tokenizer, _device
+
+    # Try OpenVINO first (best performance on Intel)
+    try:
+        from optimum.intel import OVModelForFeatureExtraction
+        from transformers import AutoTokenizer
+
+        cache_dir = Path.home() / ".cache" / "ruvultra-embedder-intel"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        ov_path = cache_dir / "bge-small-ov"
+        if ov_path.exists():
+            print(f"[embedder-intel] loading cached OpenVINO model from {ov_path}", file=sys.stderr)
+            _model = OVModelForFeatureExtraction.from_pretrained(str(ov_path), device=device)
+        else:
+            print(f"[embedder-intel] converting BAAI/bge-small-en-v1.5 to OpenVINO...", file=sys.stderr)
+            _model = OVModelForFeatureExtraction.from_pretrained(
+                "BAAI/bge-small-en-v1.5", export=True, device=device
+            )
+            _model.save_pretrained(str(ov_path))
+
+        _tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-en-v1.5")
+        _device = f"openvino-{device}"
+        print(f"[embedder-intel] model loaded: {MODEL_NAME} via OpenVINO ({device})", file=sys.stderr)
+        return
+    except ImportError:
+        pass
+
+    # Fallback: ONNX Runtime with OpenVINO EP
+    try:
+        import onnxruntime as ort
+        from transformers import AutoTokenizer
+
+        cache_dir = Path.home() / ".cache" / "ruvultra-embedder-intel"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        onnx_path = cache_dir / "model.onnx"
+        if not onnx_path.exists():
+            print(f"[embedder-intel] exporting ONNX model...", file=sys.stderr)
+            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            ort_model = ORTModelForFeatureExtraction.from_pretrained(
+                "BAAI/bge-small-en-v1.5", export=True
+            )
+            ort_model.save_pretrained(str(cache_dir))
+
+        providers = ["OpenVINOExecutionProvider", "CPUExecutionProvider"]
+        _model = ort.InferenceSession(str(onnx_path), providers=providers)
+        _tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-en-v1.5")
+        _device = f"onnx-openvino"
+        print(f"[embedder-intel] model loaded: {MODEL_NAME} via ONNX Runtime (OpenVINO EP)", file=sys.stderr)
+        return
+    except ImportError:
+        pass
+
+    # Final fallback: sentence-transformers on CPU
+    try:
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+        _tokenizer = None  # sentence-transformers handles tokenization
+        _device = "sentence-transformers-cpu"
+        print(f"[embedder-intel] model loaded: {MODEL_NAME} via sentence-transformers (CPU)", file=sys.stderr)
+        return
+    except ImportError:
+        pass
+
+    print("[embedder-intel] ERROR: no ML backend available", file=sys.stderr)
+    print("  Install one of:", file=sys.stderr)
+    print("    pip install optimum[openvino] transformers", file=sys.stderr)
+    print("    pip install onnxruntime-openvino transformers", file=sys.stderr)
+    print("    pip install sentence-transformers", file=sys.stderr)
+    sys.exit(1)
+
+
+def embed_texts(texts):
+    """Embed a batch of texts, return list of 384-d float vectors."""
+    import numpy as np
+
+    if _device and _device.startswith("sentence-transformers"):
+        vecs = _model.encode(texts, normalize_embeddings=True)
+        return [v.tolist() for v in vecs]
+
+    if _device and _device.startswith("onnx"):
+        inputs = _tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="np")
+        outputs = _model.run(None, {k: v for k, v in inputs.items()})
+        # Mean pooling over token embeddings
+        embeddings = outputs[0]  # (batch, seq_len, dim)
+        mask = inputs["attention_mask"]
+        masked = embeddings * mask[:, :, np.newaxis]
+        pooled = masked.sum(axis=1) / mask.sum(axis=1, keepdims=True)
+        # L2 normalize
+        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+        normalized = pooled / np.maximum(norms, 1e-10)
+        return [v.tolist() for v in normalized]
+
+    # OpenVINO via optimum
+    import torch
+    inputs = _tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
+    with torch.no_grad():
+        outputs = _model(**inputs)
+    embeddings = outputs.last_hidden_state
+    mask = inputs["attention_mask"].unsqueeze(-1).float()
+    pooled = (embeddings * mask).sum(dim=1) / mask.sum(dim=1)
+    normalized = torch.nn.functional.normalize(pooled, p=2, dim=1)
+    return [v.tolist() for v in normalized]
+
+
+class EmbedHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # suppress access logs
+
+    def _send_json(self, data, status=200):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send_json({
+                "status": "ok",
+                "model": MODEL_NAME,
+                "dim": DIM,
+                "backend": _device or "loading",
+            })
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/embed":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+
+            texts = body.get("texts") or body.get("text")
+            if isinstance(texts, str):
+                texts = [texts]
+            if not texts:
+                self._send_json({"error": "missing 'texts'"}, 400)
+                return
+            if len(texts) > MAX_BATCH:
+                self._send_json({"error": f"batch too large (max {MAX_BATCH})"}, 400)
+                return
+
+            t0 = time.time()
+            vectors = embed_texts(texts)
+            elapsed = time.time() - t0
+
+            self._send_json({
+                "vectors": vectors,
+                "dim": DIM,
+                "model": MODEL_NAME,
+                "backend": _device,
+                "elapsed_ms": round(elapsed * 1000, 1),
+            })
+        elif self.path == "/hard_negatives":
+            self._send_json({"negatives": [], "note": "not implemented"})
+        else:
+            self.send_error(404)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ruvultra-embedder-intel")
+    parser.add_argument("--port", type=int, default=9877)
+    parser.add_argument("--device", default="AUTO", help="OpenVINO device: AUTO, CPU, GPU")
+    args = parser.parse_args()
+
+    print(f"[embedder-intel] loading model...", file=sys.stderr)
+    load_model(args.device)
+
+    server = HTTPServer((BIND, args.port), EmbedHandler)
+    print(f"ruvultra-embedder-intel listening on {BIND}:{args.port} "
+          f"model={MODEL_NAME} dim={DIM} backend={_device}", file=sys.stderr)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
