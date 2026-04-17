@@ -2,19 +2,21 @@
 
 The first agentic operating system for AI workstations.
 
-ruOS doesn't just respond to commands — it **acts on its own behalf**. It monitors its own health, switches GPU profiles based on workload, trains itself from corrections overnight, embeds new knowledge during idle time, senses physical presence via WiFi, and updates itself from GitHub releases. All local. No cloud. No human in the loop.
+ruOS doesn't just respond to commands — it **observes, reasons, and acts** on its own behalf. A local Qwen2.5-3B model reasons about system state every 15 minutes, using RAG from a brain with 600+ memories. It monitors its own health, switches GPU profiles, trains itself overnight, embeds new knowledge during idle time, scans for prompt injection, senses physical presence via WiFi, and updates itself from GitHub releases. All local. No cloud. No external API calls.
 
 ## What Makes It Agentic
 
-Traditional operating systems wait. ruOS decides.
+Traditional operating systems wait. ruOS decides — with LLM reasoning.
 
 | Capability | What it does | How often |
 |-----------|-------------|-----------|
+| **LLM reasoning** | Qwen2.5-3B on CUDA reasons about system state via RAG | Every 15 min (or on state change) |
 | **Self-monitor** | Detects crashed services, restarts them, warns on GPU thermal | Every 5 min |
-| **Auto-profile** | Reads GPU utilization + time of day + presence, switches system profile | Every 5 min |
+| **Auto-profile** | LLM + rules evaluate GPU utilization + time + presence → profile switch | Every 5 min |
 | **Embed backfill** | Finds unvectorized memories, embeds them during GPU idle | Every 5 min (when idle) |
 | **Nightly training** | Exports preference pairs → DPO fine-tunes a LoRA adapter | Daily 3 AM |
 | **Self-evaluation** | Tests search quality on reference queries, detects drift | Hourly |
+| **AIDefence security** | Scans brain content + LLM output for injection, PII, jailbreak | Every agent cycle |
 | **Sensor context** | Maps ESP32 WiFi presence data to profile decisions | Every 5 min |
 | **Session distillation** | Saves Claude Code session insights to brain memory | Post-session |
 | **OTA updates** | Checks GitHub releases, downloads + installs new packages | Weekly |
@@ -27,14 +29,16 @@ All coordinated by a single daemon: `ruos-agent`.
 |---------|------------------|----------|-------|----------|
 | Self-healing services | systemd restart-on-failure | yes | launchd | **yes + health probes + thermal protection** |
 | AI tools built-in | no | Gemini (cloud) | Apple Intelligence (cloud) | **124 MCP tools, all local** |
-| Local brain/memory | no | no | no | **1,489 memories, semantic search, 22ms** |
+| Local brain/memory | no | no | no | **600+ memories, DiskANN search, 23ms** |
+| Local LLM reasoning | no | no | no | **Qwen2.5-3B on CUDA, 1.2s decisions** |
 | Self-training | no | no | no | **DPO overnight, LoRA adapters** |
-| Auto GPU management | no | N/A | N/A | **6 profiles, auto-switch on workload** |
+| AI security (prompt injection) | no | no | no | **AIDefence: 32 patterns, <0.1ms** |
+| Auto GPU management | no | N/A | N/A | **6 profiles, LLM-driven auto-switch** |
 | Physical sensing | no | no | no | **WiFi CSI via $9 ESP32 nodes** |
 | OTA updates | apt/dnf (manual) | yes (auto) | yes (auto) | **yes (auto from GitHub releases)** |
 | Agentic identity | no | Google account | Apple ID | **ed25519 node keys** |
 | Pre-installed AI IDE | no | no | no | **Claude Code + CLAUDE.md + .mcp.json** |
-| Runs without internet | partially | no | partially | **fully (brain, embedder, profiles, training)** |
+| Runs without internet | partially | no | partially | **fully (brain, embedder, LLM, training)** |
 
 ## Architecture
 
@@ -42,8 +46,10 @@ All coordinated by a single daemon: `ruos-agent`.
 ┌────────────────────────────────────────────────────────────────┐
 │  Claude Code + CLAUDE.md + .mcp.json       (agentic IDE)      │
 ├────────────────────────────────────────────────────────────────┤
-│  ruos-agent        ruos-update                                │
-│  (heartbeat)       (OTA)                  (autonomous layer)  │
+│  ruos-agent        ruos-update        AIDefence               │
+│  (heartbeat)       (OTA)              (security guard)        │
+├────────────────────────────────────────────────────────────────┤
+│  ruos-llm-serve (Qwen2.5-3B, CUDA)   (local LLM reasoning)  │
 ├────────────────────────────────────────────────────────────────┤
 │  102 MCP tools (stdio)  │  22 brain tools (HTTP loopback)     │
 ├─────────────────────────┴──────────────────────────────────────┤
@@ -51,7 +57,7 @@ All coordinated by a single daemon: `ruos-agent`.
 │  (Rust, stdio)      (Rust, sudo)          (Rust, CLI)         │
 ├────────────────────────────────────────────────────────────────┤
 │  mcp-brain-server   ruvultra-embedder     train_dpo.py        │
-│  (RVF + SQLite)     (candle-cuda, NVML)   (trl + peft)        │
+│  (DiskANN + SQLite) (candle-cuda, NVML)   (trl + peft)        │
 ├────────────────────────────────────────────────────────────────┤
 │  brain.rvf          adapters/             profiles/           │
 │  (cognitive store)  (LoRA weights)        (system TOML)       │
@@ -71,6 +77,10 @@ All coordinated by a single daemon: `ruos-agent`.
     │    └────┬─────┘
     │         ▼
     │    ┌──────────┐
+    │    │ REASON   │ Qwen2.5-3B + RAG from brain + AIDefence scan
+    │    └────┬─────┘
+    │         ▼
+    │    ┌──────────┐
     │    │  DECIDE  │ Which profile? Train now? Backfill? Alert?
     │    └────┬─────┘
     │         ▼
@@ -78,7 +88,7 @@ All coordinated by a single daemon: `ruos-agent`.
     └────┤   ACT    │ Switch profile, restart service, embed, train
          └──────────┘
               │
-         every 5 min
+         every 5 min (LLM every 15 min)
 ```
 
 ## 10-Level Stack
@@ -86,15 +96,15 @@ All coordinated by a single daemon: `ruos-agent`.
 | Level | Component | Status | Details |
 |-------|-----------|--------|---------|
 | 1 | Identity | Done | Ed25519 keys via `ruvultra-init identity` |
-| 2 | Brain | Done | RVF cognitive container, 1,489 memories, 100% vectorized |
-| 3 | Embedder | Done | CUDA bge-small-en-v1.5, 384-d, 2ms/embed |
-| 4 | Semantic search | Done | Partitioned cosine index, avg score 0.77 |
+| 2 | Brain | Done | RVF + SQLite, 600+ memories, 100% vectorized |
+| 3 | Embedder | Done | CUDA bge-small-en-v1.5 (384-d, 2ms) or Intel OpenVINO |
+| 4 | Semantic search | Done | DiskANN Vamana graph, avg score 0.77 |
 | 5 | MCP tools | Done | 102 stdio + 22 brain = 124 total |
-| 6 | System profiles | Done | 6 profiles, atomic apply/rollback, auto-switch |
+| 6 | System profiles | Done | 6 profiles, atomic apply/rollback, LLM-driven auto-switch |
 | 7 | Desktop app | Done | Tauri v2 + Svelte 5, gold neural theme |
 | 8 | Contrastive data | Done | 3,265 preference pairs, nightly export |
 | 9 | DPO training | Done | LoRA adapter, loss 0.081, 100% eval accuracy |
-| 10 | Agent daemon | Done | ruos-agent heartbeat + nightly training + OTA |
+| 10 | Agent + LLM + Security | Done | Qwen2.5-3B reasoning, AIDefence, OTA updates |
 
 ## Packages
 
@@ -104,18 +114,37 @@ All coordinated by a single daemon: `ruos-agent`.
 | `ruos-core` | arm64 | 829 KB | Same (no GPU deps) for Pi 5, Jetson, Apple Silicon |
 | `ruos-brain-base` | all | 359 KB | Pre-trained brain.rvf — 50 curated memories in RVF format |
 | `ruos-embedder` | amd64 | 68 MB | CUDA embedding service (candle + bge-small-en-v1.5, 384-d vectors) |
+| `ruos-embedder-intel` | all | 3.6 KB | Intel/OpenVINO embedder — drop-in replacement for CUDA variant |
 | `ruos-desktop` | amd64 | 4.8 MB | Tauri desktop dashboard (gold neural theme) |
 
 ## Autonomous Services
 
 | Service | Type | Schedule | Purpose |
 |---------|------|----------|---------|
-| `ruvultra-brain` | Long-running | Always | RVF brain backend, semantic search |
-| `ruvultra-embedder` | Long-running | Always | CUDA vector encoder |
+| `ruvultra-brain` | Long-running | Always | DiskANN brain backend, semantic search |
+| `ruvultra-embedder` | Long-running | Always | CUDA/OpenVINO vector encoder |
+| `ruos-llm` | Long-running | Always | Qwen2.5-3B local LLM for agent reasoning |
 | `ruvultra-csi-bridge` | Long-running | Always | ESP32 WiFi sensor data → brain |
-| `ruos-agent` | Timer | Every 5 min | Agentic heartbeat (observe-decide-act) |
+| `ruos-agent` | Timer | Every 5 min | Agentic heartbeat (observe-reason-decide-act) |
 | `ruos-agent-nightly` | Timer | Daily 3 AM | Export + DPO train + self-eval |
 | `ruos-update` | Timer | Weekly Sun 4 AM | OTA update check |
+
+## Security (AIDefence)
+
+Built-in AI security layer protects the brain and agent:
+
+- **32 injection patterns**: instruction override, jailbreak, DAN mode, system prompt extraction
+- **6 PII detectors**: email, phone, SSN, credit card, IP address, API keys
+- **Unicode homoglyph normalization**: Cyrillic spoofing protection
+- **RAG scanning**: brain search results scanned before entering LLM context
+- **LLM output validation**: agent decisions validated against action allowlist
+- **<0.1ms latency**: pure Python regex, no external service
+
+```bash
+ruos-agent --security test     # run 6-category threat detection test
+ruos-agent --security status   # show guard state + audit stats
+ruos-agent --security "text"   # scan arbitrary text
+```
 
 ## Self-Improvement Loop
 
@@ -128,8 +157,8 @@ Brain memories ──→ Nightly export ──→ Preference pairs (JSONL)
   ruos-agent                           DPO training (trl + peft)
   backfills vectors                           │
   monitors health                             ▼
-  switches profiles                    LoRA adapter (18 MB)
-                                              │
+  LLM reasons                         LoRA adapter (18 MB)
+  AIDefence scans                             │
                                               ▼
                                        Improved inference
 ```
@@ -159,7 +188,7 @@ ruos-update --force     # reinstall current version
 ruOS uses **RVF (RuVector Format)** as the native brain storage:
 - Append-only cognitive containers with per-segment XXH3-128 hash chains
 - 8 segment types: Memory, Vector, Manifest, Metadata, Delta, Snapshot, Tombstone, Extension
-- In-memory partitioned cosine index rebuilt on startup (1,489 vectors in <1s)
+- DiskANN Vamana graph index (brute force <2K vectors, graph search above)
 - Ed25519 signing for provenance
 - Portable: `cp brain.rvf /media/usb/` is a complete brain backup
 
@@ -262,13 +291,16 @@ The MCP server exposes 102 tools over stdio JSON-RPC 2.0 + 22 brain HTTP tools:
 ## CLI Tools
 
 ```bash
-ruos-agent              # run agentic heartbeat now
-ruos-agent --status     # show agent state + last actions
-ruos-agent --eval       # run self-evaluation
-ruos-agent --backfill   # embed unvectorized memories
-ruos-agent --train      # force DPO training now
-ruos-update --check     # check for OTA updates
-ruvultra-init status    # system overview
+ruos-bootstrap              # deploy wizard (7 roles)
+ruos-bootstrap --status     # show deployment state
+ruos-agent                  # run agentic heartbeat now
+ruos-agent --status         # show agent state + LLM reasoning
+ruos-agent --eval           # run self-evaluation
+ruos-agent --backfill       # embed unvectorized memories
+ruos-agent --train          # force DPO training now
+ruos-agent --security test  # run AIDefence test suite
+ruos-update --check         # check for OTA updates
+ruvultra-init status        # system overview
 ruvultra-profile apply gpu-train  # manual profile switch
 ```
 
@@ -291,7 +323,7 @@ Optional perception layer using ESP32-S3 nodes ($9 each):
 
 ## Architecture Decision Records
 
-15 ADRs document every design choice:
+19 ADRs document every design choice:
 
 | ADR | Title |
 |-----|-------|
@@ -310,6 +342,9 @@ Optional perception layer using ESP32-S3 nodes ($9 each):
 | 0013 | Multi-architecture testing (QEMU) |
 | 0014 | RuView WiFi sensing integration |
 | 0015 | ruos-agent agentic heartbeat daemon |
+| 0016 | DiskANN vector index + Intel OpenVINO embedder |
+| 0017 | Local LLM reasoning via Qwen2.5-3B |
+| 0018 | AIDefence security layer |
 
 ## Links
 
