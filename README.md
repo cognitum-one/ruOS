@@ -163,7 +163,45 @@ ruOS uses **RVF (RuVector Format)** as the native brain storage:
 - Ed25519 signing for provenance
 - Portable: `cp brain.rvf /media/usb/` is a complete brain backup
 
-## Install
+## Bootstrap (recommended)
+
+The interactive bootstrapper auto-detects hardware and deploys the right configuration:
+
+```bash
+bash scripts/ruos-bootstrap              # interactive wizard
+bash scripts/ruos-bootstrap --role workstation   # direct deploy
+bash scripts/ruos-bootstrap --status             # show deployment state
+```
+
+### Deployment Roles
+
+| Role | Components | Use Case |
+|------|-----------|----------|
+| `workstation` | Brain + CUDA embedder + Qwen2.5-3B LLM + agent + desktop + Claude Code | GPU workstation (RTX/Quadro) |
+| `edge` | Brain + embedder (CPU/Intel) + agent | Pi 5, Jetson, Intel NUC |
+| `cluster-primary` | Full stack + QUIC federation server + mDNS discovery | Multi-node primary |
+| `cluster-secondary` | Brain + agent, syncs from primary | Multi-node replica |
+| `agent-only` | Agent + MCP tools, remote brain | Lightweight headless node |
+| `docker` | Generate docker-compose.yml (CPU + GPU variants) | Container deployment |
+| `minimal` | Brain + MCP tools only | Smallest footprint |
+
+### Federation / Clustering
+
+```bash
+# Node A: primary (serves brain data)
+ruos-bootstrap --role cluster-primary
+
+# Node B: secondary (auto-discovers primary via mDNS)
+ruos-bootstrap --role cluster-secondary
+
+# Node C: secondary (explicit primary address)
+ruos-bootstrap --role cluster-secondary --primary 192.168.1.100:9878
+```
+
+Federation uses QUIC for brain sync, ed25519 for node authentication, and
+last-writer-wins conflict resolution. See ADR-SYS-0011.
+
+## Install (manual)
 
 ### Workstation (GPU)
 ```bash
