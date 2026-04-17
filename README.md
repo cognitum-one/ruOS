@@ -178,7 +178,7 @@ ruos-update             # download + install latest
 ruos-update --force     # reinstall current version
 ```
 
-- Checks `cognitum-one/ruVultra-linux` releases weekly
+- Checks `cognitum-one/ruOS` releases weekly
 - Downloads arch-specific `.deb` packages via `gh` CLI
 - Stops services → installs → restarts (zero-downtime for brain data)
 - Records update event in brain memory for audit trail
