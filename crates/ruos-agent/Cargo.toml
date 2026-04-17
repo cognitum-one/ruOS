@@ -1,0 +1,37 @@
+[package]
+name = "ruos-agent"
+version = "1.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+description = "ruOS agentic daemon — observe, reason, act. Self-monitoring, auto-profile, AIDefence, OTA."
+
+[[bin]]
+name = "ruos-agent"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP + async
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "fs"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# AIDefence patterns
+regex = "1"
+
+# SQLite for direct brain access
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Time
+chrono = "0.4"
+
+# Misc
+anyhow = "1"
+hex = "0.4"
+dirs = "5"
