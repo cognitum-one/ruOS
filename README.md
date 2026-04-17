@@ -1,28 +1,84 @@
 # ruOS
 
-The first agentic operating system for AI workstations. Local-first, contrastive-learning-native, self-improving — built for the Claude Code era.
+The first agentic operating system for AI workstations.
 
-ruOS turns a Linux workstation into a cognitive machine: 124 MCP tools, a local brain with semantic search, real-time GPU management, DPO self-training, and optional WiFi sensing — all running locally with no cloud dependency.
+ruOS doesn't just respond to commands — it **acts on its own behalf**. It monitors its own health, switches GPU profiles based on workload, trains itself from corrections overnight, embeds new knowledge during idle time, senses physical presence via WiFi, and updates itself from GitHub releases. All local. No cloud. No human in the loop.
+
+## What Makes It Agentic
+
+Traditional operating systems wait. ruOS decides.
+
+| Capability | What it does | How often |
+|-----------|-------------|-----------|
+| **Self-monitor** | Detects crashed services, restarts them, warns on GPU thermal | Every 5 min |
+| **Auto-profile** | Reads GPU utilization + time of day + presence, switches system profile | Every 5 min |
+| **Embed backfill** | Finds unvectorized memories, embeds them during GPU idle | Every 5 min (when idle) |
+| **Nightly training** | Exports preference pairs → DPO fine-tunes a LoRA adapter | Daily 3 AM |
+| **Self-evaluation** | Tests search quality on reference queries, detects drift | Hourly |
+| **Sensor context** | Maps ESP32 WiFi presence data to profile decisions | Every 5 min |
+| **Session distillation** | Saves Claude Code session insights to brain memory | Post-session |
+| **OTA updates** | Checks GitHub releases, downloads + installs new packages | Weekly |
+
+All coordinated by a single daemon: `ruos-agent`.
+
+## Comparison
+
+| Feature | Traditional Linux | ChromeOS | macOS | **ruOS** |
+|---------|------------------|----------|-------|----------|
+| Self-healing services | systemd restart-on-failure | yes | launchd | **yes + health probes + thermal protection** |
+| AI tools built-in | no | Gemini (cloud) | Apple Intelligence (cloud) | **124 MCP tools, all local** |
+| Local brain/memory | no | no | no | **1,489 memories, semantic search, 22ms** |
+| Self-training | no | no | no | **DPO overnight, LoRA adapters** |
+| Auto GPU management | no | N/A | N/A | **6 profiles, auto-switch on workload** |
+| Physical sensing | no | no | no | **WiFi CSI via $9 ESP32 nodes** |
+| OTA updates | apt/dnf (manual) | yes (auto) | yes (auto) | **yes (auto from GitHub releases)** |
+| Agentic identity | no | Google account | Apple ID | **ed25519 node keys** |
+| Pre-installed AI IDE | no | no | no | **Claude Code + CLAUDE.md + .mcp.json** |
+| Runs without internet | partially | no | partially | **fully (brain, embedder, profiles, training)** |
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Claude Code + CLAUDE.md + .mcp.json (agentic layer)     │
-├──────────────────────────────────────────────────────────┤
-│  102 MCP tools (stdio)  │  22 brain tools (HTTP)         │
-├─────────────────────────┴────────────────────────────────┤
-│  ruvultra-mcp        ruvultra-profile     ruvultra-init  │
-│  (Rust, stdio)       (Rust, sudo)         (Rust, CLI)    │
-├──────────────────────────────────────────────────────────┤
-│  mcp-brain-server    ruvultra-embedder    DPO trainer    │
-│  (RVF store, HTTP)   (candle-cuda, HTTP)  (trl + peft)   │
-├──────────────────────────────────────────────────────────┤
-│  brain.rvf           adapters/            profiles/      │
-│  (cognitive store)   (LoRA weights)       (system TOML)  │
-├──────────────────────────────────────────────────────────┤
-│  Linux kernel + NVIDIA driver + systemd                  │
-└──────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│  Claude Code + CLAUDE.md + .mcp.json       (agentic IDE)      │
+├────────────────────────────────────────────────────────────────┤
+│  ruos-agent        ruos-update                                │
+│  (heartbeat)       (OTA)                  (autonomous layer)  │
+├────────────────────────────────────────────────────────────────┤
+│  102 MCP tools (stdio)  │  22 brain tools (HTTP loopback)     │
+├─────────────────────────┴──────────────────────────────────────┤
+│  ruvultra-mcp       ruvultra-profile      ruvultra-init       │
+│  (Rust, stdio)      (Rust, sudo)          (Rust, CLI)         │
+├────────────────────────────────────────────────────────────────┤
+│  mcp-brain-server   ruvultra-embedder     train_dpo.py        │
+│  (RVF + SQLite)     (candle-cuda, NVML)   (trl + peft)        │
+├────────────────────────────────────────────────────────────────┤
+│  brain.rvf          adapters/             profiles/           │
+│  (cognitive store)  (LoRA weights)        (system TOML)       │
+├────────────────────────────────────────────────────────────────┤
+│  ESP32 CSI bridge   ed25519 identity      GPU (CUDA)          │
+│  (WiFi sensing)     (node keys)           (RTX/Jetson)        │
+├────────────────────────────────────────────────────────────────┤
+│  Linux kernel + NVIDIA driver + systemd                       │
+└────────────────────────────────────────────────────────────────┘
+```
+
+## The Agentic Loop
+
+```
+         ┌──────────┐
+    ┌───►│ OBSERVE  │ GPU util, temp, processes, presence, time
+    │    └────┬─────┘
+    │         ▼
+    │    ┌──────────┐
+    │    │  DECIDE  │ Which profile? Train now? Backfill? Alert?
+    │    └────┬─────┘
+    │         ▼
+    │    ┌──────────┐
+    └────┤   ACT    │ Switch profile, restart service, embed, train
+         └──────────┘
+              │
+         every 5 min
 ```
 
 ## 10-Level Stack
@@ -30,15 +86,15 @@ ruOS turns a Linux workstation into a cognitive machine: 124 MCP tools, a local 
 | Level | Component | Status | Details |
 |-------|-----------|--------|---------|
 | 1 | Identity | Done | Ed25519 keys via `ruvultra-init identity` |
-| 2 | Brain | Done | RVF cognitive container, 834+ memories |
+| 2 | Brain | Done | RVF cognitive container, 1,489 memories, 100% vectorized |
 | 3 | Embedder | Done | CUDA bge-small-en-v1.5, 384-d, 2ms/embed |
-| 4 | Semantic search | Done | Partitioned cosine index, 22ms |
+| 4 | Semantic search | Done | Partitioned cosine index, avg score 0.77 |
 | 5 | MCP tools | Done | 102 stdio + 22 brain = 124 total |
-| 6 | System profiles | Done | 6 profiles, atomic apply/rollback, MPS pre-flight |
+| 6 | System profiles | Done | 6 profiles, atomic apply/rollback, auto-switch |
 | 7 | Desktop app | Done | Tauri v2 + Svelte 5, gold neural theme |
-| 8 | Contrastive data | Done | 3,265 preference pairs exported nightly |
-| 9 | DPO training | Done | LoRA adapter trained on 205 pairs, loss 0.081 |
-| 10 | Adapter deployment | Next | Apply trained adapter to inference |
+| 8 | Contrastive data | Done | 3,265 preference pairs, nightly export |
+| 9 | DPO training | Done | LoRA adapter, loss 0.081, 100% eval accuracy |
+| 10 | Agent daemon | Done | ruos-agent heartbeat + nightly training + OTA |
 
 ## Packages
 
@@ -50,35 +106,62 @@ ruOS turns a Linux workstation into a cognitive machine: 124 MCP tools, a local 
 | `ruos-embedder` | amd64 | 68 MB | CUDA embedding service (candle + bge-small-en-v1.5, 384-d vectors) |
 | `ruos-desktop` | amd64 | 4.8 MB | Tauri desktop dashboard (gold neural theme) |
 
+## Autonomous Services
+
+| Service | Type | Schedule | Purpose |
+|---------|------|----------|---------|
+| `ruvultra-brain` | Long-running | Always | RVF brain backend, semantic search |
+| `ruvultra-embedder` | Long-running | Always | CUDA vector encoder |
+| `ruvultra-csi-bridge` | Long-running | Always | ESP32 WiFi sensor data → brain |
+| `ruos-agent` | Timer | Every 5 min | Agentic heartbeat (observe-decide-act) |
+| `ruos-agent-nightly` | Timer | Daily 3 AM | Export + DPO train + self-eval |
+| `ruos-update` | Timer | Weekly Sun 4 AM | OTA update check |
+
+## Self-Improvement Loop
+
+The machine learns from its own corrections — fully autonomous:
+
+```
+Brain memories ──→ Nightly export ──→ Preference pairs (JSONL)
+      ▲                                       │
+      │                                       ▼
+  ruos-agent                           DPO training (trl + peft)
+  backfills vectors                           │
+  monitors health                             ▼
+  switches profiles                    LoRA adapter (18 MB)
+                                              │
+                                              ▼
+                                       Improved inference
+```
+
+- **Export**: nightly cron extracts chosen/rejected pairs from brain corrections
+- **Train**: `train_dpo.py` fine-tunes TinyLlama-1.1B with LoRA (r=16, beta=0.1)
+- **Result**: 100% eval accuracy, reward margin 13.96, loss 0.081 on 205 pairs
+- **Schedule**: fully autonomous — export at 3 AM, train, eval, no human needed
+
+## OTA Updates
+
+ruOS updates itself from GitHub releases:
+
+```bash
+ruos-update --check     # see if update is available
+ruos-update             # download + install latest
+ruos-update --force     # reinstall current version
+```
+
+- Checks `cognitum-one/ruVultra-linux` releases weekly
+- Downloads arch-specific `.deb` packages via `gh` CLI
+- Stops services → installs → restarts (zero-downtime for brain data)
+- Records update event in brain memory for audit trail
+
 ## Storage Format
 
 ruOS uses **RVF (RuVector Format)** as the native brain storage:
 - Append-only cognitive containers with per-segment XXH3-128 hash chains
 - 8 segment types: Memory, Vector, Manifest, Metadata, Delta, Snapshot, Tombstone, Extension
-- In-memory partitioned cosine index rebuilt on startup
-- Ed25519 signing for provenance (via `ruvultra-init identity`)
+- In-memory partitioned cosine index rebuilt on startup (1,489 vectors in <1s)
+- Ed25519 signing for provenance
 - Portable: `cp brain.rvf /media/usb/` is a complete brain backup
-
-## Self-Improvement Loop
-
-ruOS closes the learning loop — the machine improves from its own corrections:
-
-```
-Brain memories ──→ Nightly export ──→ Preference pairs (JSONL)
-                                           │
-                                           ▼
-                                    DPO training (trl + peft)
-                                           │
-                                           ▼
-                                    LoRA adapter (18 MB)
-                                           │
-                                           ▼
-                                    Improved inference
-```
-
-- **Export**: `export_pairs.py` extracts chosen/rejected pairs from brain votes and corrections
-- **Train**: `train_dpo.py` fine-tunes TinyLlama-1.1B with LoRA (r=16, beta=0.1) using DPO
-- **Result**: 100% eval accuracy, reward margin 13.96, loss 0.081 on 205 real preference pairs
 
 ## Install
 
@@ -120,9 +203,9 @@ make test-arm64   # test arm64 via QEMU emulation
 make release      # build + package + test everything
 ```
 
-## MCP Tools (102)
+## MCP Tools (124)
 
-The MCP server exposes 102 tools over stdio JSON-RPC 2.0:
+The MCP server exposes 102 tools over stdio JSON-RPC 2.0 + 22 brain HTTP tools:
 
 | Category | Count | Examples |
 |----------|-------|---------|
@@ -137,6 +220,19 @@ The MCP server exposes 102 tools over stdio JSON-RPC 2.0:
 | Diagnostics | 11 | `ruv_diag_health`, `ruv_diag_benchmarks` |
 | Identity | 4 | `ruv_identity_status`, `ruv_identity_verify` |
 | Sensor / ESP32 | 6 | `ruv_sensor_list`, `ruv_sensor_presence`, `ruv_sensor_vitals` |
+
+## CLI Tools
+
+```bash
+ruos-agent              # run agentic heartbeat now
+ruos-agent --status     # show agent state + last actions
+ruos-agent --eval       # run self-evaluation
+ruos-agent --backfill   # embed unvectorized memories
+ruos-agent --train      # force DPO training now
+ruos-update --check     # check for OTA updates
+ruvultra-init status    # system overview
+ruvultra-profile apply gpu-train  # manual profile switch
+```
 
 ## Tested Architectures
 
@@ -153,11 +249,33 @@ Optional perception layer using ESP32-S3 nodes ($9 each):
 - Presence detection, vital signs (breathing/heart rate), activity recognition
 - WiFi CSI (Channel State Information) — no cameras, through walls
 - Data flows as RVF segments into the brain for searchable sensor history
-- See [ADR-SYS-0014](docs/adr/) for architecture details
+- Agent daemon uses presence data for automatic profile switching
+
+## Architecture Decision Records
+
+15 ADRs document every design choice:
+
+| ADR | Title |
+|-----|-------|
+| 0001 | MCP stdio server architecture |
+| 0002 | Local private brain backend |
+| 0003 | GPU management via NVML |
+| 0004 | Contrastive learning (DPO/IPO preference pairs) |
+| 0005 | System profile management with rollback |
+| 0006 | Local vector store and embeddings |
+| 0007 | Profile-based GPU optimization |
+| 0008 | RVF format for brain storage |
+| 0009 | Ed25519 identity and signing |
+| 0010 | Cross-compilation for arm64 |
+| 0011 | QUIC federation protocol |
+| 0012 | Desktop app (Tauri + Svelte 5) |
+| 0013 | Multi-architecture testing (QEMU) |
+| 0014 | RuView WiFi sensing integration |
+| 0015 | ruos-agent agentic heartbeat daemon |
 
 ## Links
 
-- Platform repo: [cognitum-one/ruVultra](https://github.com/cognitum-one/ruVultra) (MCP server, desktop app, ADRs)
+- Platform: [cognitum-one/ruVultra](https://github.com/cognitum-one/ruVultra) (MCP server, desktop app, ADRs)
 - RuView: [ruvnet/RuView](https://github.com/ruvnet/RuView) (WiFi sensing firmware)
 - Cognitum: [cognitum.one](https://cognitum.one)
 
