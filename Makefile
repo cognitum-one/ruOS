@@ -40,6 +40,9 @@ deb: deb-amd64 deb-arm64
 deb-brain:
 	$(SCRIPTS)/build-brain-deb.sh
 
+deb-desktop:
+	$(SCRIPTS)/build-desktop-deb.sh
+
 deb-embedder:
 	$(SCRIPTS)/build-embedder-deb.sh
 

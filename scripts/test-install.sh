@@ -74,6 +74,26 @@ docker exec "${CONTAINER}" sh -c "
   test -f /usr/share/ruvultra/brain-base.rvf && echo 'brain-base.rvf: installed OK'
   test -f /root/brain-data/brain.rvf && echo 'brain.rvf copied to HOME: OK'
 
+  echo '--- Agentic config ---'
+  test -f /etc/ruvultra/CLAUDE.md && echo 'CLAUDE.md: installed OK'
+  test -f /etc/ruvultra/mcp.json && echo 'mcp.json: installed OK'
+  test -f /usr/local/share/ruos/install-claude-code.sh && echo 'install-claude-code.sh: installed OK'
+
+  # Verify CLAUDE.md content
+  if grep -q 'ruv_meta_boot_context' /etc/ruvultra/CLAUDE.md 2>/dev/null; then
+    echo 'CLAUDE.md content: OK (mentions boot_context)'
+  else
+    echo 'CLAUDE.md content: WARN — missing boot_context reference'
+  fi
+
+  # Verify mcp.json has both servers
+  if python3 -c 'import json; d=json.load(open("/etc/ruvultra/mcp.json")); s=d["mcpServers"]; assert "ruvultra" in s and "mcp-brain" in s' 2>/dev/null; then
+    echo 'mcp.json: OK (ruvultra + mcp-brain configured)'
+  else
+    echo 'mcp.json: WARN — missing expected MCP servers'
+  fi
+
+  echo '=== AGENTIC OS READY ==='
   echo 'ALL CHECKS PASSED'
 "
 

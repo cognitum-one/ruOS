@@ -47,6 +47,7 @@ mkdir -p "${STAGE}/etc/ruvultra-profiles"
 mkdir -p "${STAGE}/usr/lib/systemd/user"
 mkdir -p "${STAGE}/etc/sudoers.d"
 mkdir -p "${STAGE}/etc/ruvultra"
+mkdir -p "${STAGE}/usr/local/share/ruos"
 
 # Install core binaries (both arches)
 install -m 755 "${BINDIR}/ruvultra-mcp" "${STAGE}/usr/local/bin/ruvultra-mcp"
@@ -93,17 +94,44 @@ if [ -f "${SRCDIR}/sudoers.d/ruvultra-profile" ]; then
   install -m 440 "${SRCDIR}/sudoers.d/ruvultra-profile" "${STAGE}/etc/sudoers.d/ruvultra-profile"
 fi
 
-# Install .mcp.json template
-cat > "${STAGE}/etc/ruvultra/mcp.json.template" <<'MCPEOF'
+# Install agentic config files
+if [ -f "${PROJDIR}/config/mcp.json" ]; then
+  cp "${PROJDIR}/config/mcp.json" "${STAGE}/etc/ruvultra/mcp.json"
+else
+  # Fallback: minimal mcp.json template
+  cat > "${STAGE}/etc/ruvultra/mcp.json" <<'MCPEOF'
 {
   "mcpServers": {
     "ruvultra": {
       "command": "/usr/local/bin/ruvultra-mcp",
-      "args": []
+      "args": [],
+      "env": { "RUST_LOG": "warn" },
+      "autoStart": true
+    },
+    "mcp-brain": {
+      "command": "/usr/local/bin/mcp-brain",
+      "args": [],
+      "env": {
+        "RUST_LOG": "warn",
+        "RUVBRAIN_URL": "http://127.0.0.1:9876",
+        "MCP_BRAIN_VOTER": "ruos-local"
+      },
+      "autoStart": true
     }
   }
 }
 MCPEOF
+fi
+
+# Install CLAUDE.md (agentic instructions for Claude Code)
+if [ -f "${PROJDIR}/config/CLAUDE.md" ]; then
+  cp "${PROJDIR}/config/CLAUDE.md" "${STAGE}/etc/ruvultra/CLAUDE.md"
+fi
+
+# Install Claude Code installer script
+if [ -f "${PROJDIR}/scripts/install-claude-code.sh" ]; then
+  install -m 755 "${PROJDIR}/scripts/install-claude-code.sh" "${STAGE}/usr/local/share/ruos/install-claude-code.sh"
+fi
 
 # Write DEBIAN/control — architecture-specific, NOT "any"
 cat > "${STAGE}/DEBIAN/control" <<EOF
@@ -123,18 +151,32 @@ EOF
 cat > "${STAGE}/DEBIAN/conffiles" <<EOF
 /etc/ruvultra-profiles/default.toml
 /etc/sudoers.d/ruvultra-profile
-/etc/ruvultra/mcp.json.template
+/etc/ruvultra/mcp.json
+/etc/ruvultra/CLAUDE.md
 EOF
 
 # Write postinst
 cat > "${STAGE}/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 set -e
+
 # Reload systemd if available
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user daemon-reload 2>/dev/null || true
 fi
-echo "ruos-core installed. Run 'ruvultra-mcp --help' to verify."
+
+# Generate identity if ruvultra-init is available
+if [ -x /usr/local/bin/ruvultra-init ]; then
+  /usr/local/bin/ruvultra-init identity 2>/dev/null || true
+fi
+
+# Try to install Claude Code (gracefully fails offline)
+if [ -f /usr/local/share/ruos/install-claude-code.sh ]; then
+  sh /usr/local/share/ruos/install-claude-code.sh 2>/dev/null || true
+fi
+
+echo "ruos-core installed. Run 'ruvultra-init setup' to configure the agentic environment."
+echo "Then type 'claude' to start."
 POSTINST
 chmod 755 "${STAGE}/DEBIAN/postinst"
 

@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "ruvultra": {
+      "command": "/usr/local/bin/ruvultra-mcp",
+      "args": [],
+      "env": { "RUST_LOG": "warn" },
+      "autoStart": true
+    },
+    "mcp-brain": {
+      "command": "/usr/local/bin/mcp-brain",
+      "args": [],
+      "env": {
+        "RUST_LOG": "warn",
+        "RUVBRAIN_URL": "http://127.0.0.1:9876",
+        "MCP_BRAIN_VOTER": "ruos-local"
+      },
+      "autoStart": true
+    }
+  }
+}

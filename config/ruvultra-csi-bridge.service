@@ -1,0 +1,30 @@
+[Unit]
+Description=ruOS CSI bridge — ESP32 RuView UDP → brain
+After=ruvultra-brain.service
+Wants=ruvultra-brain.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u -c "\
+import socket,json,urllib.request,time;\
+sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);\
+sock.bind(('0.0.0.0',5005));\
+sock.settimeout(60);\
+count=0;last_write=0;\
+while True:\
+ try:\
+  data,addr=sock.recvfrom(4096);count+=1;\
+  now=time.time();\
+  if now-last_write>=60:\
+   body=json.dumps({'category':'sensor-csi','content':f'CSI summary: {count} frames from {addr[0]} in last 60s, latest={len(data)}B'}).encode();\
+   req=urllib.request.Request('http://127.0.0.1:9876/memories',data=body,headers={'Content-Type':'application/json'});\
+   try:urllib.request.urlopen(req,timeout=3)\
+   except:pass;\
+   count=0;last_write=now;\
+ except socket.timeout:pass\
+"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

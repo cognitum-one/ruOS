@@ -53,6 +53,12 @@ cp -r "$HOME/.config/ruvultra-profiles/"*.toml "${INSTALLER_DIR}/config/" 2>/dev
 cp "$HOME/.config/systemd/user/ruvultra-brain.service" "${INSTALLER_DIR}/config/" 2>/dev/null || true
 cp "$HOME/.config/systemd/user/ruvultra-embedder.service" "${INSTALLER_DIR}/config/" 2>/dev/null || true
 
+echo "==> Copying agentic config (Claude Code + MCP)..."
+PROJDIR="$(dirname "$SCRIPT_DIR")"
+[ -f "${PROJDIR}/config/CLAUDE.md" ] && cp "${PROJDIR}/config/CLAUDE.md" "${INSTALLER_DIR}/config/" && echo "  CLAUDE.md"
+[ -f "${PROJDIR}/config/mcp.json" ] && cp "${PROJDIR}/config/mcp.json" "${INSTALLER_DIR}/config/" && echo "  mcp.json"
+[ -f "${PROJDIR}/scripts/install-claude-code.sh" ] && cp "${PROJDIR}/scripts/install-claude-code.sh" "${INSTALLER_DIR}/bin/" && echo "  install-claude-code.sh"
+
 echo "==> Copying brain data (RVF format)..."
 if [ -f "$HOME/brain-data/brain.rvf" ]; then
   cp "$HOME/brain-data/brain.rvf" "${INSTALLER_DIR}/brain/"
@@ -107,6 +113,16 @@ fi
 # Copy profiles
 mkdir -p "$HOME/.config/ruvultra-profiles"
 cp "${SCRIPT_DIR}/config/"*.toml "$HOME/.config/ruvultra-profiles/" 2>/dev/null || true
+
+# Copy agentic config
+[ -f "${SCRIPT_DIR}/config/CLAUDE.md" ] && [ ! -f "$HOME/CLAUDE.md" ] && cp "${SCRIPT_DIR}/config/CLAUDE.md" "$HOME/CLAUDE.md" && echo "==> Copied CLAUDE.md"
+[ -f "${SCRIPT_DIR}/config/mcp.json" ] && [ ! -f "$HOME/.mcp.json" ] && cp "${SCRIPT_DIR}/config/mcp.json" "$HOME/.mcp.json" && echo "==> Copied .mcp.json"
+
+# Try to install Claude Code
+if [ -f "${SCRIPT_DIR}/bin/install-claude-code.sh" ]; then
+  echo "==> Installing Claude Code..."
+  sh "${SCRIPT_DIR}/bin/install-claude-code.sh" 2>/dev/null || true
+fi
 
 # Run init if available
 if command -v ruvultra-init >/dev/null 2>&1; then
