@@ -1,0 +1,742 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ruos-bootstrap — deploy ruOS in any configuration
+#
+#  Usage:
+#    ruos-bootstrap                          # interactive wizard
+#    ruos-bootstrap --role workstation       # GPU workstation (full stack)
+#    ruos-bootstrap --role edge              # Pi/Jetson edge node
+#    ruos-bootstrap --role cluster-primary   # federation primary
+#    ruos-bootstrap --role cluster-secondary # join existing cluster
+#    ruos-bootstrap --role agent-only        # headless agent node
+#    ruos-bootstrap --role docker            # docker compose deployment
+#    ruos-bootstrap --status                 # show current deployment
+#
+#  Deployment roles:
+#    workstation      — full stack: brain + embedder + LLM + agent + desktop
+#    edge             — brain + embedder (CPU) + agent, no LLM, no desktop
+#    cluster-primary  — full stack + federation server + discovery
+#    cluster-secondary — brain + agent, syncs with primary via QUIC
+#    agent-only       — agent + MCP tools, connects to remote brain
+#    docker           — containerized deployment via docker compose
+#    minimal          — brain + MCP only, no agent, no LLM
+# ═══════════════════════════════════════════════════════════════════════════════
+
+VERSION="0.7.0"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+STATE_DIR="$HOME/.local/state/ruos-agent"
+CONFIG_DIR="$HOME/.config/ruvultra-profiles"
+BRAIN_DIR="$HOME/brain-data"
+BIN_DIR="$HOME/.local/bin"
+SYSTEMD_DIR="$HOME/.config/systemd/user"
+
+# Colors
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'
+
+log()  { echo -e "${GREEN}==> $*${NC}"; }
+warn() { echo -e "${YELLOW}  ! $*${NC}"; }
+err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
+info() { echo -e "${CYAN}  $*${NC}"; }
+
+# ─── Hardware Detection ──────────────────────────────────────────────────────
+
+detect_hardware() {
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)  DEB_ARCH="amd64" ;;
+        aarch64) DEB_ARCH="arm64" ;;
+        *)       DEB_ARCH="$ARCH" ;;
+    esac
+
+    HAS_NVIDIA=false
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+        GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+        HAS_NVIDIA=true
+    fi
+
+    HAS_INTEL_GPU=false
+    if lspci 2>/dev/null | grep -qi "Intel.*Arc\|Intel.*Graphics"; then
+        HAS_INTEL_GPU=true
+    fi
+
+    RAM_GB=$(free -g | awk '/Mem:/{print $2}')
+    CORES=$(nproc 2>/dev/null || echo 1)
+    DISK_FREE=$(df -BG "$HOME" | tail -1 | awk '{print $4}' | tr -d 'G')
+
+    HAS_ESP32=false
+    if ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -1 >/dev/null 2>&1; then
+        HAS_ESP32=true
+    fi
+}
+
+print_hardware() {
+    echo -e "${BOLD}Hardware Detection${NC}"
+    echo "  Arch:     $ARCH ($DEB_ARCH)"
+    echo "  CPU:      $CORES cores"
+    echo "  RAM:      ${RAM_GB}G"
+    echo "  Disk:     ${DISK_FREE}G free"
+    if $HAS_NVIDIA; then
+        echo -e "  GPU:      ${GREEN}$GPU_NAME ($GPU_VRAM MB VRAM)${NC}"
+    elif $HAS_INTEL_GPU; then
+        echo -e "  GPU:      ${BLUE}Intel Arc/iGPU${NC}"
+    else
+        echo "  GPU:      none"
+    fi
+    $HAS_ESP32 && echo -e "  Sensor:   ${GREEN}ESP32 detected${NC}" || echo "  Sensor:   none"
+}
+
+# ─── Role Recommendations ───────────────────────────────────────────────────
+
+recommend_role() {
+    if $HAS_NVIDIA && [ "${GPU_VRAM:-0}" -ge 8000 ]; then
+        echo "workstation"
+    elif $HAS_NVIDIA; then
+        echo "edge"
+    elif $HAS_INTEL_GPU; then
+        echo "edge"
+    elif [ "$RAM_GB" -ge 8 ]; then
+        echo "edge"
+    else
+        echo "minimal"
+    fi
+}
+
+# ─── Installation Functions ──────────────────────────────────────────────────
+
+install_core() {
+    log "Installing ruOS core..."
+    mkdir -p "$BIN_DIR" "$BRAIN_DIR" "$CONFIG_DIR" "$STATE_DIR" "$SYSTEMD_DIR"
+
+    # Install from .deb if available
+    local deb_dir="$PROJECT_DIR/out/deb"
+    if [ -d "$deb_dir" ]; then
+        local core_deb="$deb_dir/ruos-core_${VERSION}_${DEB_ARCH}.deb"
+        local brain_deb="$deb_dir/ruos-brain-base_${VERSION}_all.deb"
+        if [ -f "$core_deb" ]; then
+            sudo dpkg -i "$core_deb" 2>/dev/null && info "Installed ruos-core ($DEB_ARCH)"
+        fi
+        if [ -f "$brain_deb" ]; then
+            sudo dpkg -i "$brain_deb" 2>/dev/null && info "Installed ruos-brain-base"
+        fi
+    fi
+
+    # Fallback: copy binaries directly
+    for bin in ruvultra-mcp ruvultra-profile ruvultra-init mcp-brain-server-local; do
+        local src="$PROJECT_DIR/out/${DEB_ARCH}/$bin"
+        [ -f "$src" ] || src="$BIN_DIR/$bin"
+        [ -f "$src" ] && cp "$src" "$BIN_DIR/" && chmod +x "$BIN_DIR/$bin" 2>/dev/null
+    done
+
+    # Initialize identity if not exists
+    if command -v ruvultra-init >/dev/null 2>&1; then
+        ruvultra-init identity 2>/dev/null || true
+    fi
+
+    info "Core installed"
+}
+
+install_brain_service() {
+    log "Setting up brain service..."
+    cat > "$SYSTEMD_DIR/ruvultra-brain.service" << 'UNIT'
+[Unit]
+Description=ruvultra local private brain backend
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mcp-brain-server-local
+Environment=RUVBRAIN_PORT=9876
+Restart=on-failure
+RestartSec=5
+MemoryHigh=2G
+MemoryMax=4G
+
+[Install]
+WantedBy=default.target
+UNIT
+    systemctl --user daemon-reload
+    systemctl --user enable --now ruvultra-brain.service 2>/dev/null || true
+    info "Brain service active on 127.0.0.1:9876"
+}
+
+install_embedder() {
+    local backend="$1"  # cuda, intel, cpu
+
+    log "Installing embedder ($backend)..."
+    case "$backend" in
+        cuda)
+            local deb="$PROJECT_DIR/out/deb/ruos-embedder_${VERSION}_amd64.deb"
+            if [ -f "$deb" ]; then
+                sudo dpkg -i "$deb" 2>/dev/null
+            elif [ -f "$BIN_DIR/ruvultra-embedder" ]; then
+                info "Using existing embedder binary"
+            fi
+            ;;
+        intel)
+            local deb="$PROJECT_DIR/out/deb/ruos-embedder-intel_${VERSION}_all.deb"
+            if [ -f "$deb" ]; then
+                sudo dpkg -i "$deb" 2>/dev/null
+            elif [ -f "$PROJECT_DIR/packages/ruos-embedder-intel/ruvultra-embedder-intel" ]; then
+                cp "$PROJECT_DIR/packages/ruos-embedder-intel/ruvultra-embedder-intel" "$BIN_DIR/"
+                chmod +x "$BIN_DIR/ruvultra-embedder-intel"
+            fi
+            ;;
+        cpu)
+            warn "CPU-only embedder: using Intel/OpenVINO package"
+            install_embedder intel
+            return
+            ;;
+    esac
+
+    cat > "$SYSTEMD_DIR/ruvultra-embedder.service" << 'UNIT'
+[Unit]
+Description=ruvultra local embedding service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ruvultra-embedder
+Restart=on-failure
+RestartSec=5
+MemoryHigh=2G
+MemoryMax=4G
+
+[Install]
+WantedBy=default.target
+UNIT
+    systemctl --user daemon-reload
+    systemctl --user enable --now ruvultra-embedder.service 2>/dev/null || true
+    info "Embedder service active on 127.0.0.1:9877 ($backend)"
+}
+
+install_agent() {
+    log "Installing ruos-agent..."
+
+    # Copy agent + support files
+    for f in ruos-agent ruos-update; do
+        local src="$PROJECT_DIR/packages/ruos-agent/$f"
+        [ -f "$src" ] && cp "$src" "$BIN_DIR/" && chmod +x "$BIN_DIR/$f"
+    done
+
+    # Install AIDefence
+    mkdir -p "$HOME/.local/lib/ruos"
+    if [ -f "$PROJECT_DIR/packages/ruos-agent/aidefence.py" ]; then
+        cp "$PROJECT_DIR/packages/ruos-agent/aidefence.py" "$HOME/.local/lib/ruos/"
+    fi
+
+    # Install systemd timers
+    for unit in ruos-agent.service ruos-agent.timer ruos-agent-nightly.service \
+                ruos-agent-nightly.timer ruos-update.service ruos-update.timer; do
+        local src="$PROJECT_DIR/config/systemd/$unit"
+        [ -f "$src" ] && cp "$src" "$SYSTEMD_DIR/"
+    done
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now ruos-agent.timer 2>/dev/null || true
+    systemctl --user enable --now ruos-agent-nightly.timer 2>/dev/null || true
+    systemctl --user enable --now ruos-update.timer 2>/dev/null || true
+    info "Agent active (heartbeat every 5 min, nightly training 3 AM, OTA weekly)"
+}
+
+install_llm() {
+    log "Installing local LLM (Qwen2.5-3B)..."
+
+    # Copy LLM serve script
+    local src="$PROJECT_DIR/packages/ruos-agent/ruos-llm-serve"
+    if [ -f "$src" ]; then
+        cp "$src" "$BIN_DIR/"
+        chmod +x "$BIN_DIR/ruos-llm-serve"
+    fi
+
+    # Install systemd unit
+    local unit="$PROJECT_DIR/config/systemd/ruos-llm.service"
+    [ -f "$unit" ] && cp "$unit" "$SYSTEMD_DIR/"
+
+    # Download model if not cached
+    if [ ! -d "$HOME/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct" ]; then
+        info "Downloading Qwen2.5-3B-Instruct (5.8 GB)..."
+        if command -v huggingface-cli >/dev/null 2>&1; then
+            huggingface-cli download Qwen/Qwen2.5-3B-Instruct 2>/dev/null || warn "Download failed — LLM will start in mock mode"
+        else
+            warn "huggingface-cli not found — install: pip install huggingface_hub"
+            warn "Then: huggingface-cli download Qwen/Qwen2.5-3B-Instruct"
+        fi
+    else
+        info "Qwen2.5-3B already cached"
+    fi
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now ruos-llm.service 2>/dev/null || true
+    info "LLM service active on 127.0.0.1:8080"
+}
+
+install_desktop() {
+    log "Installing desktop app..."
+    local deb="$PROJECT_DIR/out/deb/ruos-desktop_${VERSION}_amd64.deb"
+    if [ -f "$deb" ]; then
+        sudo dpkg -i "$deb" 2>/dev/null && info "Desktop app installed"
+    else
+        warn "Desktop .deb not found — skip"
+    fi
+}
+
+install_sensor() {
+    log "Setting up ESP32 CSI bridge..."
+    local unit="$SYSTEMD_DIR/ruvultra-csi-bridge.service"
+    if [ -f "$unit" ]; then
+        systemctl --user enable --now ruvultra-csi-bridge.service 2>/dev/null || true
+        info "CSI bridge active"
+    else
+        warn "CSI bridge service not found — skip"
+    fi
+}
+
+install_claude_code() {
+    log "Installing Claude Code..."
+    if command -v claude >/dev/null 2>&1; then
+        info "Claude Code already installed: $(claude --version 2>/dev/null | head -1)"
+    elif [ -f "$PROJECT_DIR/scripts/install-claude-code.sh" ]; then
+        bash "$PROJECT_DIR/scripts/install-claude-code.sh" 2>/dev/null || warn "Install failed (needs internet)"
+    fi
+
+    # Copy agentic config
+    if [ ! -f "$HOME/CLAUDE.md" ] && [ -f "$PROJECT_DIR/config/CLAUDE.md" ]; then
+        cp "$PROJECT_DIR/config/CLAUDE.md" "$HOME/CLAUDE.md"
+        info "Copied CLAUDE.md"
+    fi
+    if [ ! -f "$HOME/.mcp.json" ] && [ -f "$PROJECT_DIR/config/mcp.json" ]; then
+        cp "$PROJECT_DIR/config/mcp.json" "$HOME/.mcp.json"
+        info "Copied .mcp.json"
+    fi
+}
+
+install_profiles() {
+    log "Installing system profiles..."
+    mkdir -p "$CONFIG_DIR"
+    for toml in "$PROJECT_DIR/config/"*.toml; do
+        [ -f "$toml" ] && cp "$toml" "$CONFIG_DIR/" && info "  $(basename $toml)"
+    done
+}
+
+# ─── Federation / Clustering ────────────────────────────────────────────────
+
+setup_federation_primary() {
+    log "Configuring federation primary..."
+
+    # Generate cluster identity
+    if command -v ruvultra-init >/dev/null 2>&1; then
+        ruvultra-init identity 2>/dev/null || true
+    fi
+
+    # Create federation config
+    mkdir -p "$HOME/.config/ruos-federation"
+    cat > "$HOME/.config/ruos-federation/cluster.toml" << TOML
+[cluster]
+role = "primary"
+node_id = "$(hostname)"
+listen_addr = "0.0.0.0:9878"
+protocol = "quic"
+
+[discovery]
+method = "mdns"          # mDNS for local network auto-discovery
+service_name = "_ruos._udp.local"
+
+[sync]
+interval_sec = 60        # sync brain with secondaries every 60s
+max_batch = 100           # max memories per sync batch
+conflict_resolution = "last-writer-wins"
+
+[auth]
+method = "ed25519"        # use node identity keys
+allow_anonymous = false
+TOML
+
+    # Create federation service
+    cat > "$SYSTEMD_DIR/ruos-federation.service" << 'UNIT'
+[Unit]
+Description=ruOS federation server (QUIC brain sync)
+After=ruvultra-brain.service
+Requires=ruvultra-brain.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ruos-federation-server
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+UNIT
+
+    info "Federation primary configured"
+    info "  Listen: 0.0.0.0:9878 (QUIC)"
+    info "  Discovery: mDNS (_ruos._udp.local)"
+    info "  Auth: ed25519 node keys"
+    info "  Sync: every 60s, LWW conflict resolution"
+    warn "Federation server binary not yet built — see ADR-SYS-0011"
+}
+
+setup_federation_secondary() {
+    local primary="${1:-}"
+
+    log "Configuring federation secondary..."
+
+    mkdir -p "$HOME/.config/ruos-federation"
+    cat > "$HOME/.config/ruos-federation/cluster.toml" << TOML
+[cluster]
+role = "secondary"
+node_id = "$(hostname)"
+primary_addr = "${primary:-auto}"   # "auto" = discover via mDNS
+
+[sync]
+interval_sec = 60
+pull_only = true         # secondary only pulls, never pushes
+conflict_resolution = "primary-wins"
+
+[auth]
+method = "ed25519"
+TOML
+
+    info "Federation secondary configured"
+    if [ -n "$primary" ]; then
+        info "  Primary: $primary"
+    else
+        info "  Primary: auto-discover via mDNS"
+    fi
+}
+
+# ─── Docker Deployment ───────────────────────────────────────────────────────
+
+setup_docker() {
+    log "Generating docker-compose deployment..."
+
+    cat > "$PROJECT_DIR/docker-compose.yml" << 'COMPOSE'
+version: '3.8'
+
+services:
+  brain:
+    image: ubuntu:24.04
+    volumes:
+      - brain-data:/brain-data
+      - ./out/amd64:/usr/local/bin:ro
+    command: /usr/local/bin/mcp-brain-server-local
+    environment:
+      - RUVBRAIN_PORT=9876
+    ports:
+      - "127.0.0.1:9876:9876"
+    restart: unless-stopped
+    mem_limit: 2g
+
+  embedder:
+    image: ubuntu:24.04
+    volumes:
+      - ./out/amd64:/usr/local/bin:ro
+      - embedder-cache:/root/.cache/ruvultra-embedder
+    command: /usr/local/bin/ruvultra-embedder
+    ports:
+      - "127.0.0.1:9877:9877"
+    restart: unless-stopped
+    mem_limit: 2g
+
+  agent:
+    image: python:3.12-slim
+    volumes:
+      - brain-data:/brain-data
+      - ./packages/ruos-agent:/usr/local/bin:ro
+    command: /usr/local/bin/ruos-agent
+    depends_on:
+      - brain
+      - embedder
+    restart: "no"
+
+volumes:
+  brain-data:
+  embedder-cache:
+COMPOSE
+
+    cat > "$PROJECT_DIR/docker-compose.gpu.yml" << 'COMPOSE'
+version: '3.8'
+
+services:
+  brain:
+    extends:
+      file: docker-compose.yml
+      service: brain
+
+  embedder:
+    extends:
+      file: docker-compose.yml
+      service: embedder
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  llm:
+    image: python:3.12-slim
+    volumes:
+      - ./packages/ruos-agent:/usr/local/bin:ro
+      - huggingface-cache:/root/.cache/huggingface
+    command: /usr/local/bin/ruos-llm-serve --model Qwen/Qwen2.5-3B-Instruct
+    ports:
+      - "127.0.0.1:8080:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    mem_limit: 12g
+
+  agent:
+    extends:
+      file: docker-compose.yml
+      service: agent
+    depends_on:
+      - brain
+      - embedder
+      - llm
+
+volumes:
+  brain-data:
+  embedder-cache:
+  huggingface-cache:
+COMPOSE
+
+    info "Generated docker-compose.yml (CPU) and docker-compose.gpu.yml (NVIDIA)"
+    info "  docker compose up -d                              # CPU only"
+    info "  docker compose -f docker-compose.gpu.yml up -d    # with GPU"
+}
+
+# ─── Role Deployment ─────────────────────────────────────────────────────────
+
+deploy_role() {
+    local role="$1"
+
+    echo ""
+    echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║  ruOS Bootstrap — ${role}$(printf '%*s' $((34 - ${#role})) '')║${NC}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    case "$role" in
+        workstation)
+            install_core
+            install_brain_service
+            install_embedder cuda
+            install_llm
+            install_agent
+            install_profiles
+            install_desktop
+            install_claude_code
+            $HAS_ESP32 && install_sensor
+            ;;
+        edge)
+            install_core
+            install_brain_service
+            if $HAS_NVIDIA; then
+                install_embedder cuda
+            elif $HAS_INTEL_GPU; then
+                install_embedder intel
+            else
+                install_embedder cpu
+            fi
+            install_agent
+            install_profiles
+            install_claude_code
+            $HAS_ESP32 && install_sensor
+            ;;
+        cluster-primary)
+            install_core
+            install_brain_service
+            if $HAS_NVIDIA; then
+                install_embedder cuda
+                install_llm
+            else
+                install_embedder cpu
+            fi
+            install_agent
+            install_profiles
+            install_claude_code
+            setup_federation_primary
+            $HAS_ESP32 && install_sensor
+            ;;
+        cluster-secondary)
+            install_core
+            install_brain_service
+            install_embedder cpu
+            install_agent
+            setup_federation_secondary "${PRIMARY_ADDR:-}"
+            ;;
+        agent-only)
+            install_core
+            install_agent
+            install_claude_code
+            info "Agent-only: connect to remote brain via RUVBRAIN_URL env var"
+            ;;
+        docker)
+            setup_docker
+            ;;
+        minimal)
+            install_core
+            install_brain_service
+            install_claude_code
+            ;;
+        *)
+            err "Unknown role: $role"
+            exit 1
+            ;;
+    esac
+
+    echo ""
+    log "Bootstrap complete! Role: $role"
+    echo ""
+}
+
+# ─── Status ──────────────────────────────────────────────────────────────────
+
+show_status() {
+    echo -e "${BOLD}ruOS Deployment Status${NC}"
+    echo "=" * 50
+
+    detect_hardware
+    print_hardware
+    echo ""
+
+    echo -e "${BOLD}Services${NC}"
+    for svc in ruvultra-brain ruvultra-embedder ruos-llm ruvultra-csi-bridge; do
+        if systemctl --user is-active "$svc" >/dev/null 2>&1; then
+            echo -e "  ${GREEN}●${NC} $svc"
+        else
+            echo -e "  ${RED}○${NC} $svc"
+        fi
+    done
+
+    echo ""
+    echo -e "${BOLD}Timers${NC}"
+    for tmr in ruos-agent ruos-agent-nightly ruos-update; do
+        if systemctl --user is-active "$tmr.timer" >/dev/null 2>&1; then
+            echo -e "  ${GREEN}●${NC} $tmr.timer"
+        else
+            echo -e "  ${RED}○${NC} $tmr.timer"
+        fi
+    done
+
+    echo ""
+    echo -e "${BOLD}Data${NC}"
+    [ -f "$BRAIN_DIR/brain.sqlite" ] && echo "  Brain: $(sqlite3 "$BRAIN_DIR/brain.sqlite" 'SELECT COUNT(*) FROM memories;' 2>/dev/null || echo '?') memories"
+    [ -f "$BRAIN_DIR/brain.rvf" ] && echo "  RVF: $(du -h "$BRAIN_DIR/brain.rvf" | cut -f1)"
+    ls "$BRAIN_DIR/adapters/"*/manifest.json 2>/dev/null | while read m; do
+        echo "  Adapter: $(python3 -c "import json; d=json.load(open('$m')); print(f'{d[\"name\"]} (loss={d[\"loss\"]:.4f})')" 2>/dev/null)"
+    done
+
+    # Federation
+    if [ -f "$HOME/.config/ruos-federation/cluster.toml" ]; then
+        echo ""
+        echo -e "${BOLD}Federation${NC}"
+        grep "role\|primary_addr\|listen_addr" "$HOME/.config/ruos-federation/cluster.toml" | sed 's/^/  /'
+    fi
+}
+
+# ─── Interactive Wizard ──────────────────────────────────────────────────────
+
+wizard() {
+    echo -e "${BOLD}"
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║                                                      ║"
+    echo "║   ruOS — The First Agentic Operating System          ║"
+    echo "║                                                      ║"
+    echo "║   Bootstrap Wizard                                   ║"
+    echo "║                                                      ║"
+    echo "╚══════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+
+    detect_hardware
+    print_hardware
+    echo ""
+
+    local recommended=$(recommend_role)
+
+    echo -e "${BOLD}Deployment Roles:${NC}"
+    echo ""
+    echo "  1) workstation        Full stack: brain + CUDA embedder + Qwen2.5-3B LLM"
+    echo "                        + agent + desktop + Claude Code + sensors"
+    echo ""
+    echo "  2) edge               Brain + embedder + agent (no LLM, no desktop)"
+    echo "                        For Pi 5, Jetson, Intel NUC"
+    echo ""
+    echo "  3) cluster-primary    Full stack + federation server (QUIC brain sync)"
+    echo "                        Other nodes sync brain data from this node"
+    echo ""
+    echo "  4) cluster-secondary  Brain + agent, pulls from primary via QUIC"
+    echo "                        Auto-discovers primary via mDNS"
+    echo ""
+    echo "  5) agent-only         Agent + MCP tools, connects to remote brain"
+    echo "                        Lightweight — no local brain or embedder"
+    echo ""
+    echo "  6) docker             Generate docker-compose files (CPU + GPU)"
+    echo ""
+    echo "  7) minimal            Brain + MCP tools only (no agent, no LLM)"
+    echo ""
+
+    echo -e "  Recommended for this hardware: ${GREEN}${recommended}${NC}"
+    echo ""
+    read -p "  Select role [1-7, or name] (default: $recommended): " choice
+
+    case "${choice:-$recommended}" in
+        1|workstation)      deploy_role workstation ;;
+        2|edge)             deploy_role edge ;;
+        3|cluster-primary)  deploy_role cluster-primary ;;
+        4|cluster-secondary)
+            read -p "  Primary node address (or 'auto' for mDNS): " PRIMARY_ADDR
+            export PRIMARY_ADDR
+            deploy_role cluster-secondary
+            ;;
+        5|agent-only)       deploy_role agent-only ;;
+        6|docker)           deploy_role docker ;;
+        7|minimal)          deploy_role minimal ;;
+        *)                  deploy_role "${choice:-$recommended}" ;;
+    esac
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+main() {
+    local role=""
+    local primary_addr=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --role)     role="$2"; shift 2 ;;
+            --primary)  primary_addr="$2"; shift 2 ;;
+            --status)   detect_hardware; show_status; exit 0 ;;
+            --help|-h)
+                echo "Usage: ruos-bootstrap [--role ROLE] [--primary ADDR] [--status]"
+                echo "Roles: workstation, edge, cluster-primary, cluster-secondary, agent-only, docker, minimal"
+                exit 0
+                ;;
+            *)          shift ;;
+        esac
+    done
+
+    detect_hardware
+
+    if [ -n "$role" ]; then
+        [ -n "$primary_addr" ] && export PRIMARY_ADDR="$primary_addr"
+        deploy_role "$role"
+    else
+        wizard
+    fi
+}
+
+main "$@"
