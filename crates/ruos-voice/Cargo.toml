@@ -1,0 +1,33 @@
+[package]
+name = "ruos-voice"
+version = "0.1.0"
+edition = "2021"
+description = "ruOS Jarvis-style voice control daemon"
+
+[[bin]]
+name = "ruos-voice"
+path = "src/main.rs"
+
+[dependencies]
+# Audio capture
+cpal = "0.15"
+
+# Async
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
+
+# HTTP client (for brain + LLM)
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Audio processing
+hound = "3"  # WAV read/write
+
+# Misc
+anyhow = "1"
+chrono = "0.4"
