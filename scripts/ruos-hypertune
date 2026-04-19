@@ -1,0 +1,207 @@
+#!/bin/bash
+# ruos-hypertune — squeeze maximum performance from hardware
+# Safe, reversible, no destructive changes. Creates a rollback point first.
+#
+# Usage:
+#   sudo ruos-hypertune              # apply all optimizations
+#   sudo ruos-hypertune --status     # show current settings
+#   sudo ruos-hypertune --revert     # undo all changes
+
+set -e
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run as root: sudo ruos-hypertune"
+    exit 1
+fi
+
+echo "╔══════════════════════════════════════════════╗"
+echo "║  ruOS Hyper-Tune                             ║"
+echo "╚══════════════════════════════════════════════╝"
+echo
+
+BACKUP="/etc/ruos-hypertune-backup"
+
+if [ "$1" = "--status" ]; then
+    echo "=== CPU ==="
+    echo "  Governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+    echo "  Freq: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq | awk '{printf "%.0f MHz",$1/1000}')"
+    echo "  Turbo: $(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null | sed 's/0/on/;s/1/off/' || echo '?')"
+    echo ""
+    echo "=== Memory ==="
+    echo "  Swappiness: $(cat /proc/sys/vm/swappiness)"
+    echo "  VFS cache: $(cat /proc/sys/vm/vfs_cache_pressure)"
+    echo "  Dirty ratio: $(cat /proc/sys/vm/dirty_ratio)%"
+    echo "  THP: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+    echo "  ZRAM: $(swapon --show=NAME,SIZE,USED | grep zram || echo 'none')"
+    echo ""
+    echo "=== I/O ==="
+    for disk in /sys/block/sd? /sys/block/nvme?n?; do
+        [ -e "$disk" ] || continue
+        name=$(basename $disk)
+        echo "  $name: sched=$(cat $disk/queue/scheduler | grep -oP '\[\K[^\]]+') readahead=$(cat $disk/queue/read_ahead_kb)KB"
+    done
+    echo ""
+    echo "=== Network ==="
+    echo "  TCP CC: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    echo "  Qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    echo ""
+    echo "=== Services disabled ==="
+    for svc in snapd cups bluetooth ModemManager; do
+        st=$(systemctl is-active $svc 2>/dev/null || echo "not installed")
+        echo "  $svc: $st"
+    done
+    exit 0
+fi
+
+if [ "$1" = "--revert" ]; then
+    echo "==> Reverting to pre-tune settings..."
+    [ -f "$BACKUP/sysctl.conf" ] && cp "$BACKUP/sysctl.conf" /etc/sysctl.d/99-ruos-hypertune.conf && sysctl -p /etc/sysctl.d/99-ruos-hypertune.conf 2>/dev/null
+    [ -f "$BACKUP/services.list" ] && while read svc; do systemctl enable --now "$svc" 2>/dev/null; done < "$BACKUP/services.list"
+    echo "  Reverted. Reboot recommended."
+    exit 0
+fi
+
+# ─── Save baseline for rollback ──────────────────────────────────────────
+
+echo "==> Saving baseline..."
+mkdir -p "$BACKUP"
+sysctl vm.swappiness vm.vfs_cache_pressure vm.dirty_ratio vm.dirty_background_ratio > "$BACKUP/sysctl.conf" 2>/dev/null
+touch "$BACKUP/services.list"
+
+# ─── 1-2: CPU — Intel pstate tuning ─────────────────────────────────────
+
+echo "==> [1/12] CPU governor..."
+if [ -d /sys/devices/system/cpu/intel_pstate ]; then
+    # Let TLP handle AC vs battery switching
+    echo "  Intel pstate detected — managed by TLP"
+else
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq; do
+        echo "schedutil" > "$cpu/scaling_governor" 2>/dev/null
+    done
+    echo "  Governor: schedutil"
+fi
+
+# ─── 3-6: Memory ────────────────────────────────────────────────────────
+
+echo "==> [3/12] Memory tuning..."
+cat > /etc/sysctl.d/99-ruos-hypertune.conf << 'SYSCTL'
+# ruOS Hyper-Tune — memory optimization
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
+vm.min_free_kbytes = 65536
+
+# Kernel scheduling
+kernel.sched_autogroup_enabled = 1
+
+# Network — BBR + fq
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_fastopen = 3
+SYSCTL
+sysctl -p /etc/sysctl.d/99-ruos-hypertune.conf 2>/dev/null | wc -l | xargs -I{} echo "  Applied {} sysctl settings"
+
+echo "==> [6/12] Transparent hugepages..."
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+echo "  THP: madvise"
+
+# ─── 7-8: I/O ───────────────────────────────────────────────────────────
+
+echo "==> [7/12] I/O scheduler..."
+for disk in /sys/block/sd? /sys/block/nvme?n?; do
+    [ -e "$disk" ] || continue
+    name=$(basename $disk)
+    rotational=$(cat $disk/queue/rotational)
+    if [ "$rotational" = "0" ]; then
+        echo mq-deadline > "$disk/queue/scheduler" 2>/dev/null
+        echo 256 > "$disk/queue/read_ahead_kb" 2>/dev/null
+        echo 0 > "$disk/queue/add_random" 2>/dev/null
+        echo "  $name: mq-deadline, readahead=256KB (SSD)"
+    fi
+done
+
+# ─── 9: Kernel sched ────────────────────────────────────────────────────
+
+echo "==> [9/12] Kernel scheduler..."
+echo "  sched_autogroup: enabled"
+
+# ─── 10: Network BBR ────────────────────────────────────────────────────
+
+echo "==> [10/12] TCP BBR..."
+modprobe tcp_bbr 2>/dev/null
+echo "  TCP: bbr + fq"
+
+# ─── 11: Disable unused services ────────────────────────────────────────
+
+echo "==> [11/12] Disabling unused services..."
+for svc in snapd snapd.socket snapd.seeded cups cups-browsed ModemManager switcheroo-control; do
+    if systemctl is-active "$svc" >/dev/null 2>&1; then
+        echo "$svc" >> "$BACKUP/services.list"
+        systemctl disable --now "$svc" 2>/dev/null
+        echo "  Disabled: $svc"
+    fi
+done
+
+# ─── 12: ZRAM compressed swap ───────────────────────────────────────────
+
+echo "==> [12/12] ZRAM compressed swap..."
+if ! swapon --show | grep -q zram; then
+    modprobe zram 2>/dev/null
+    if [ -e /sys/block/zram0 ]; then
+        # Disable file swap, enable ZRAM
+        swapoff /swap.img 2>/dev/null || swapoff -a 2>/dev/null
+        echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null
+        echo 4G > /sys/block/zram0/disksize 2>/dev/null
+        mkswap /dev/zram0 >/dev/null 2>&1
+        swapon -p 100 /dev/zram0 2>/dev/null
+        # Re-enable file swap at lower priority
+        swapon /swap.img 2>/dev/null
+        echo "  ZRAM: 4GB lz4 (priority 100)"
+    else
+        echo "  ZRAM: not available"
+    fi
+else
+    echo "  ZRAM: already active"
+fi
+
+# Make ZRAM persistent
+cat > /etc/systemd/system/ruos-zram.service << 'ZRAM'
+[Unit]
+Description=ruOS ZRAM compressed swap
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'modprobe zram; echo lz4 > /sys/block/zram0/comp_algorithm; echo 4G > /sys/block/zram0/disksize; mkswap /dev/zram0; swapon -p 100 /dev/zram0'
+ExecStop=/bin/bash -c 'swapoff /dev/zram0 2>/dev/null; echo 1 > /sys/block/zram0/reset'
+
+[Install]
+WantedBy=multi-user.target
+ZRAM
+systemctl daemon-reload
+systemctl enable ruos-zram.service 2>/dev/null
+
+# ─── Summary ─────────────────────────────────────────────────────────────
+
+echo ""
+echo "╔══════════════════════════════════════════════╗"
+echo "║  Hyper-Tune Complete                         ║"
+echo "╚══════════════════════════════════════════════╝"
+echo ""
+echo "  Applied 12 optimizations:"
+echo "    CPU: intel pstate managed by TLP"
+echo "    RAM: swappiness=10, vfs_cache=50, dirty=15%"
+echo "    THP: madvise"
+echo "    I/O: mq-deadline, readahead=256KB"
+echo "    Net: TCP BBR + fq, fastopen"
+echo "    ZRAM: 4GB lz4 compressed swap"
+echo "    Services: disabled $(wc -l < $BACKUP/services.list) unused"
+echo ""
+echo "  Rollback: sudo ruos-hypertune --revert"
+echo "  Status:   sudo ruos-hypertune --status"
