@@ -259,3 +259,198 @@ async fn collect_external_apis() {
         }
     }
 }
+
+// ─── Extended Collectors ────────────────────────────────────────────────────
+
+/// NASA FIRMS — near-real-time fire detection (free, no auth).
+async fn collect_fires() {
+    let loc_path = dirs::home_dir().unwrap_or_default()
+        .join(".local/share/ruview/geo-cache/location.json");
+    if let Ok(data) = std::fs::read_to_string(&loc_path) {
+        if let Ok(loc) = serde_json::from_str::<serde_json::Value>(&data) {
+            let lat = loc.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let lon = loc.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            // FIRMS VIIRS 24h within 50km
+            let url = format!(
+                "https://firms.modaps.eosdis.nasa.gov/api/area/csv/OPEN_KEY/VIIRS_SNPP_NRT/{},{},50/1",
+                lat, lon
+            );
+            match reqwest::get(&url).await {
+                Ok(resp) => {
+                    let text = resp.text().await.unwrap_or_default();
+                    let fires = text.lines().skip(1).count(); // skip header
+                    let content = if fires > 0 {
+                        format!("FIRE ALERT: {} active fires detected within 50km in last 24h", fires)
+                    } else {
+                        "No active fires within 50km".to_string()
+                    };
+                    println!("  fires: {content}");
+                    store("safety-alert", &content).await;
+                }
+                Err(_) => println!("  fires: API unavailable"),
+            }
+        }
+    }
+}
+
+/// OpenAQ — air quality (free, no auth for basic queries).
+async fn collect_air_quality() {
+    let loc_path = dirs::home_dir().unwrap_or_default()
+        .join(".local/share/ruview/geo-cache/location.json");
+    if let Ok(data) = std::fs::read_to_string(&loc_path) {
+        if let Ok(loc) = serde_json::from_str::<serde_json::Value>(&data) {
+            let lat = loc.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let lon = loc.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let url = format!(
+                "https://api.openaq.org/v2/latest?coordinates={},{}&radius=25000&limit=5",
+                lat, lon
+            );
+            match reqwest::get(&url).await {
+                Ok(resp) => {
+                    if let Ok(data) = resp.json::<serde_json::Value>().await {
+                        let results = data.get("results").and_then(|r| r.as_array());
+                        if let Some(results) = results {
+                            let mut readings = Vec::new();
+                            for r in results.iter().take(3) {
+                                let measurements = r.get("measurements").and_then(|m| m.as_array());
+                                if let Some(ms) = measurements {
+                                    for m in ms {
+                                        let param = m.get("parameter").and_then(|p| p.as_str()).unwrap_or("?");
+                                        let value = m.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                        let unit = m.get("unit").and_then(|u| u.as_str()).unwrap_or("");
+                                        readings.push(format!("{param}={value:.1}{unit}"));
+                                    }
+                                }
+                            }
+                            let content = if readings.is_empty() {
+                                "No air quality data nearby".to_string()
+                            } else {
+                                format!("Air quality: {}", readings.join(", "))
+                            };
+                            println!("  air: {content}");
+                            store("air-quality", &content).await;
+                        }
+                    }
+                }
+                Err(_) => println!("  air: API unavailable"),
+            }
+        }
+    }
+}
+
+/// Camera-based object detection (luminance regions, no ML model needed).
+async fn collect_objects() {
+    // Capture a frame and analyze regions
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-f", "v4l2", "-video_size", "640x480", "-i", "/dev/video0",
+               "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24",
+               "/tmp/ruos-object-frame.rgb"])
+        .output();
+
+    if let Ok(o) = output {
+        if o.status.success() {
+            if let Ok(data) = std::fs::read("/tmp/ruos-object-frame.rgb") {
+                let w = 640usize;
+                let h = 480usize;
+                if data.len() >= w * h * 3 {
+                    // Analyze frame: count bright/dark/colored regions
+                    let mut bright = 0u32;
+                    let mut dark = 0u32;
+                    let mut red = 0u32;
+                    let mut green = 0u32;
+                    let mut blue = 0u32;
+
+                    for i in 0..w * h {
+                        let ri = i * 3;
+                        let r = data[ri] as u32;
+                        let g = data[ri + 1] as u32;
+                        let b = data[ri + 2] as u32;
+                        let lum = (r * 299 + g * 587 + b * 114) / 1000;
+
+                        if lum > 180 { bright += 1; }
+                        else if lum < 40 { dark += 1; }
+
+                        if r > 150 && g < 100 && b < 100 { red += 1; }
+                        if g > 150 && r < 100 && b < 100 { green += 1; }
+                        if b > 150 && r < 100 && g < 100 { blue += 1; }
+                    }
+
+                    let total = (w * h) as f32;
+                    let bright_pct = bright as f32 / total * 100.0;
+                    let dark_pct = dark as f32 / total * 100.0;
+
+                    let mut objects = Vec::new();
+                    if bright_pct > 10.0 { objects.push(format!("screens/lights ({bright_pct:.0}%)")); }
+                    if red > 1000 { objects.push(format!("red objects ({} px)", red)); }
+                    if green > 1000 { objects.push(format!("green objects ({} px)", green)); }
+                    if blue > 1000 { objects.push(format!("blue objects ({} px)", blue)); }
+
+                    let lighting = if bright_pct > 30.0 { "well-lit" }
+                        else if dark_pct > 70.0 { "dark" }
+                        else { "dim" };
+
+                    let content = format!("Room: {lighting}. {}",
+                        if objects.is_empty() { "No distinct objects detected".into() }
+                        else { objects.join(", ") });
+                    println!("  objects: {content}");
+                    store("room-objects", &content).await;
+                }
+            }
+            let _ = std::fs::remove_file("/tmp/ruos-object-frame.rgb");
+        }
+    }
+}
+
+/// Lighting history — track light levels over time.
+async fn collect_lighting() {
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-f", "v4l2", "-video_size", "160x120", "-i", "/dev/video0",
+               "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24",
+               "/tmp/ruos-light-sample.rgb"])
+        .output();
+
+    if let Ok(o) = output {
+        if o.status.success() {
+            if let Ok(data) = std::fs::read("/tmp/ruos-light-sample.rgb") {
+                let pixels = data.len() / 3;
+                if pixels > 0 {
+                    let avg_lum: f32 = (0..pixels)
+                        .map(|i| {
+                            let ri = i * 3;
+                            (data[ri] as f32 * 0.299 + data[ri+1] as f32 * 0.587 + data[ri+2] as f32 * 0.114)
+                        })
+                        .sum::<f32>() / pixels as f32;
+
+                    // Color temperature estimate (warm vs cool)
+                    let avg_r: f32 = (0..pixels).map(|i| data[i*3] as f32).sum::<f32>() / pixels as f32;
+                    let avg_b: f32 = (0..pixels).map(|i| data[i*3+2] as f32).sum::<f32>() / pixels as f32;
+                    let warmth = if avg_r > avg_b + 20.0 { "warm" } else if avg_b > avg_r + 20.0 { "cool" } else { "neutral" };
+
+                    let content = format!("Lighting: luminance {avg_lum:.0}/255, color temp {warmth}");
+                    println!("  lighting: {content}");
+                    store("lighting-history", &content).await;
+                }
+            }
+            let _ = std::fs::remove_file("/tmp/ruos-light-sample.rgb");
+        }
+    }
+}
+
+/// Extended collection — includes NASA FIRMS, OpenAQ, objects, lighting.
+pub async fn collect_extended() -> Result<()> {
+    collect_all().await?;
+
+    // Extended sensors (need geo consent)
+    if consent::is_consented("geo-satellite") {
+        collect_fires().await;
+        collect_air_quality().await;
+    }
+
+    // Camera-based (need camera consent)
+    if consent::is_consented("camera-objects") {
+        collect_objects().await;
+        collect_lighting().await;
+    }
+
+    Ok(())
+}
