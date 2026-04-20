@@ -114,10 +114,13 @@ async fn main() -> Result<()> {
 
         println!("\n  Heard: \"{trimmed}\"");
         let response = commands::execute(&trimmed).await;
+        if response.is_empty() { continue; } // empty = don't speak (echo filter)
         println!("  → {response}");
 
         if !cli.silent {
             tts::speak(&response);
+            // Wait for TTS to finish before resuming mic to avoid echo loop
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 

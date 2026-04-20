@@ -1,0 +1,21 @@
+[package]
+name = "ruos-sensors"
+version = "0.1.0"
+edition = "2021"
+description = "ruOS sensor collector — opt-in consent + 30 data sources for brain"
+
+[[bin]]
+name = "ruos-sensors"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
+sha2 = "0.10"
+hex = "0.4"
+dirs = "5"

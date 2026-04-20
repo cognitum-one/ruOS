@@ -9,10 +9,32 @@ use tokio::sync::mpsc;
 
 const SAMPLE_RATE: u32 = 16000;
 const CHANNELS: u16 = 1;
-const ENERGY_THRESHOLD: f32 = 0.01;      // RMS energy to detect speech
+const ENERGY_THRESHOLD: f32 = 0.15;      // RMS energy to detect speech (Mac mic is sensitive)
 const SILENCE_TIMEOUT_MS: u64 = 1500;    // Silence after speech = end of utterance
 const MIN_SPEECH_MS: u64 = 500;          // Minimum speech duration
 const MAX_SPEECH_MS: u64 = 15000;        // Maximum recording length
+
+/// Check if the mic is muted (PulseAudio/PipeWire) or if the control file says paused.
+fn is_mic_muted() -> bool {
+    // Check control file first (set by tray icon)
+    let control = std::path::Path::new("/tmp/ruos-voice-paused");
+    if control.exists() {
+        return true;
+    }
+
+    // Check PulseAudio/PipeWire mic mute state
+    if let Ok(output) = std::process::Command::new("pactl")
+        .args(["get-source-mute", "@DEFAULT_SOURCE@"])
+        .output()
+    {
+        let out = String::from_utf8_lossy(&output.stdout);
+        if out.contains("yes") {
+            return true;
+        }
+    }
+
+    false
+}
 
 pub fn list_devices() -> anyhow::Result<()> {
     let host = cpal::default_host();
@@ -77,6 +99,14 @@ pub fn listen_loop(
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Check if mic is muted — sleep if so
+        if is_mic_muted() {
+            // Clear buffer while muted
+            buffer.lock().unwrap().clear();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        }
 
         let samples = {
             let mut buf = buffer.lock().unwrap();
@@ -143,8 +173,17 @@ pub fn listen_loop(
         }
 
         // Transcribe with Whisper
+        eprintln!("  [STT] Transcribing...");
         let text = transcribe(&wav_path, &whisper_model);
-        if text.is_empty() { continue; }
+
+        // Cooldown after transcription to save CPU
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        buffer.lock().unwrap().clear(); // discard audio during cooldown
+
+        if text.is_empty() {
+            eprintln!("  [STT] (empty result)");
+            continue;
+        }
 
         eprintln!("  [STT] \"{text}\"");
 
@@ -187,15 +226,12 @@ fn write_wav(path: &std::path::Path, samples: &[f32]) -> anyhow::Result<()> {
 }
 
 fn transcribe(wav_path: &std::path::Path, model: &str) -> String {
-    // Try whisper-cpp CLI first (fastest)
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/finn".to_string());
+    // Use -t 2 to limit CPU (don't max all cores on a laptop)
     let whisper_cmds = [
-        format!("whisper-cpp -m /usr/share/whisper-cpp/models/ggml-{model}.bin -f {wav} -np -nt",
+        format!("whisper-cpp -t 2 -m {home}/.local/share/whisper/ggml-{model}.bin -f {wav} -np -nt",
             wav = wav_path.display()),
-        // Fallback: whisper.cpp from home
-        format!("$HOME/.local/bin/whisper-cpp -m $HOME/.local/share/whisper/ggml-{model}.bin -f {wav} -np -nt",
-            wav = wav_path.display()),
-        // Fallback: Python whisper (slower)
-        format!("whisper {wav} --model {model} --output_format txt --output_dir /tmp 2>/dev/null && cat /tmp/ruos-voice-chunk.txt",
+        format!("whisper-cpp -t 2 -m /usr/share/whisper-cpp/models/ggml-{model}.bin -f {wav} -np -nt",
             wav = wav_path.display()),
     ];
 
