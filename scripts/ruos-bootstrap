@@ -42,6 +42,76 @@ warn() { echo -e "${YELLOW}  ! $*${NC}"; }
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
 info() { echo -e "${CYAN}  $*${NC}"; }
 
+# ─── Source resolution ────────────────────────────────────────────────────────
+# ruos-bootstrap ships two ways: from a git checkout (scripts/ sits beside
+# packages/ and config/) and inside ruos-agent.deb, which installs it to
+# /usr/local/bin. In the deb case PROJECT_DIR resolves to "/usr/local", so every
+# "$PROJECT_DIR/packages/..." lookup missed. Because each copy was guarded with
+# [ -f "$src" ] && cp ..., those misses were silent: bootstrap reported success,
+# $BIN_DIR stayed empty, and every shipped unit — which references
+# %h/.local/bin/... — failed at status=203/EXEC on first start.
+#
+# These resolvers try the checkout first, then the FHS paths the .deb populates.
+# Each echoes a path and returns non-zero when nothing exists.
+
+IS_CHECKOUT=0
+[ -d "$PROJECT_DIR/packages" ] && [ -d "$PROJECT_DIR/config/systemd" ] && IS_CHECKOUT=1
+
+find_bin() {
+    local name="$1" c
+    for c in "$PROJECT_DIR/packages/ruos-agent/$name" \
+             "$PROJECT_DIR/packages/ruos-core/$name" \
+             "$PROJECT_DIR/packages/ruos-embedder-intel/$name" \
+             "$PROJECT_DIR/out/${DEB_ARCH:-amd64}/$name" \
+             "/usr/local/bin/$name" \
+             "/usr/bin/$name"; do
+        [ -f "$c" ] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+find_unit() {
+    local name="$1" c
+    for c in "$PROJECT_DIR/config/systemd/$name" "/usr/lib/systemd/user/$name"; do
+        [ -f "$c" ] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+find_asset() {
+    local rel="$1" base c
+    base="$(basename "$rel")"
+    for c in "$PROJECT_DIR/$rel" "/usr/local/lib/ruos/$base" \
+             "/usr/share/ruvultra/$base" "/etc/ruvultra/$base" \
+             "/etc/ruvultra-profiles/$base"; do
+        [ -f "$c" ] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+# Put a binary in $BIN_DIR. Symlink when it is already installed system-wide so
+# a later `apt upgrade` is picked up automatically; copy when it came from a
+# checkout, where there is nothing stable to point at.
+place_bin() {
+    local name="$1" src
+    src="$(find_bin "$name")" || { warn "$name: not found in checkout or system paths"; return 1; }
+    mkdir -p "$BIN_DIR"
+    case "$src" in
+        /usr/local/bin/*|/usr/bin/*) ln -sfn "$src" "$BIN_DIR/$name" ;;
+        *) cp "$src" "$BIN_DIR/$name" && chmod +x "$BIN_DIR/$name" ;;
+    esac
+    info "$name <- $src"
+}
+
+# Copy a unit into the user systemd dir from wherever it actually lives.
+place_unit() {
+    local name="$1" src
+    src="$(find_unit "$name")" || { warn "$name: unit not found"; return 1; }
+    mkdir -p "$SYSTEMD_DIR"
+    cp "$src" "$SYSTEMD_DIR/$name"
+}
+
+
 # ─── Hardware Detection ──────────────────────────────────────────────────────
 
 detect_hardware() {
@@ -125,11 +195,10 @@ install_core() {
         fi
     fi
 
-    # Fallback: copy binaries directly
+    # Place binaries from wherever they exist (checkout, out/, or /usr/local/bin
+    # once the .deb has been installed).
     for bin in ruvultra-mcp ruvultra-profile ruvultra-init mcp-brain-server-local; do
-        local src="$PROJECT_DIR/out/${DEB_ARCH}/$bin"
-        [ -f "$src" ] || src="$BIN_DIR/$bin"
-        [ -f "$src" ] && cp "$src" "$BIN_DIR/" && chmod +x "$BIN_DIR/$bin" 2>/dev/null
+        place_bin "$bin" || true
     done
 
     # Initialize identity if not exists
@@ -181,9 +250,8 @@ install_embedder() {
             local deb="$PROJECT_DIR/out/deb/ruos-embedder-intel_${VERSION}_all.deb"
             if [ -f "$deb" ]; then
                 sudo dpkg -i "$deb" 2>/dev/null
-            elif [ -f "$PROJECT_DIR/packages/ruos-embedder-intel/ruvultra-embedder-intel" ]; then
-                cp "$PROJECT_DIR/packages/ruos-embedder-intel/ruvultra-embedder-intel" "$BIN_DIR/"
-                chmod +x "$BIN_DIR/ruvultra-embedder-intel"
+            else
+                place_bin ruvultra-embedder-intel || true
             fi
             ;;
         cpu)
@@ -217,23 +285,23 @@ UNIT
 install_agent() {
     log "Installing ruos-agent..."
 
-    # Copy agent + support files
-    for f in ruos-agent ruos-update; do
-        local src="$PROJECT_DIR/packages/ruos-agent/$f"
-        [ -f "$src" ] && cp "$src" "$BIN_DIR/" && chmod +x "$BIN_DIR/$f"
+    # Place agent + support files
+    for f in ruos-agent ruos-update ruos-bootstrap; do
+        place_bin "$f" || true
     done
 
     # Install AIDefence
     mkdir -p "$HOME/.local/lib/ruos"
-    if [ -f "$PROJECT_DIR/packages/ruos-agent/aidefence.py" ]; then
-        cp "$PROJECT_DIR/packages/ruos-agent/aidefence.py" "$HOME/.local/lib/ruos/"
+    if src="$(find_asset packages/ruos-agent/aidefence.py)"; then
+        cp "$src" "$HOME/.local/lib/ruos/"
+    else
+        warn "aidefence.py not found — agent will run without the defence layer"
     fi
 
     # Install systemd timers
     for unit in ruos-agent.service ruos-agent.timer ruos-agent-nightly.service \
                 ruos-agent-nightly.timer ruos-update.service ruos-update.timer; do
-        local src="$PROJECT_DIR/config/systemd/$unit"
-        [ -f "$src" ] && cp "$src" "$SYSTEMD_DIR/"
+        place_unit "$unit" || true
     done
 
     systemctl --user daemon-reload
@@ -246,16 +314,11 @@ install_agent() {
 install_llm() {
     log "Installing local LLM (Qwen2.5-3B)..."
 
-    # Copy LLM serve script
-    local src="$PROJECT_DIR/packages/ruos-agent/ruos-llm-serve"
-    if [ -f "$src" ]; then
-        cp "$src" "$BIN_DIR/"
-        chmod +x "$BIN_DIR/ruos-llm-serve"
-    fi
+    # Place LLM serve script
+    place_bin ruos-llm-serve || true
 
     # Install systemd unit
-    local unit="$PROJECT_DIR/config/systemd/ruos-llm.service"
-    [ -f "$unit" ] && cp "$unit" "$SYSTEMD_DIR/"
+    place_unit ruos-llm.service || true
 
     # Download model if not cached
     if [ ! -d "$HOME/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct" ]; then
@@ -305,22 +368,31 @@ install_claude_code() {
     fi
 
     # Copy agentic config
-    if [ ! -f "$HOME/CLAUDE.md" ] && [ -f "$PROJECT_DIR/config/CLAUDE.md" ]; then
-        cp "$PROJECT_DIR/config/CLAUDE.md" "$HOME/CLAUDE.md"
-        info "Copied CLAUDE.md"
+    # ruos-core ships these to /etc/ruvultra/; the checkout keeps them in config/.
+    if [ ! -f "$HOME/CLAUDE.md" ] && src="$(find_asset config/CLAUDE.md)"; then
+        cp "$src" "$HOME/CLAUDE.md"
+        info "Copied CLAUDE.md <- $src"
     fi
-    if [ ! -f "$HOME/.mcp.json" ] && [ -f "$PROJECT_DIR/config/mcp.json" ]; then
-        cp "$PROJECT_DIR/config/mcp.json" "$HOME/.mcp.json"
-        info "Copied .mcp.json"
+    if [ ! -f "$HOME/.mcp.json" ] && src="$(find_asset config/mcp.json)"; then
+        cp "$src" "$HOME/.mcp.json"
+        info "Copied .mcp.json <- $src"
     fi
 }
 
 install_profiles() {
     log "Installing system profiles..."
     mkdir -p "$CONFIG_DIR"
-    for toml in "$PROJECT_DIR/config/"*.toml; do
-        [ -f "$toml" ] && cp "$toml" "$CONFIG_DIR/" && info "  $(basename $toml)"
+    # Checkout keeps profiles in config/; ruos-core installs them to
+    # /etc/ruvultra-profiles/. Take whichever directory actually has them.
+    local found=0 d
+    for d in "$PROJECT_DIR/config" /etc/ruvultra-profiles; do
+        for toml in "$d/"*.toml; do
+            [ -f "$toml" ] || continue
+            cp "$toml" "$CONFIG_DIR/" && info "  $(basename "$toml") <- $d" && found=1
+        done
+        [ "$found" -eq 1 ] && break
     done
+    [ "$found" -eq 1 ] || warn "no profile .toml found in checkout or /etc/ruvultra-profiles" 
 }
 
 # ─── Federation / Clustering ────────────────────────────────────────────────
@@ -709,6 +781,92 @@ wizard() {
     esac
 }
 
+
+# ─── Post-install verification ───────────────────────────────────────────────
+# Every install step above is best-effort: a missing source is a warning, not a
+# failure. That is deliberate — roles are partial by design — but it means a
+# bootstrap can report success while leaving a system that cannot start. This
+# checks the end state instead of the steps, and is the difference between
+# "bootstrap said OK" and "the services can actually run".
+#
+# Exit status is advisory: non-zero when something shipped is unusable.
+
+verify_install() {
+    log "Verifying installation..."
+    local problems=0 unit target
+
+    # 1. Every ExecStart target must exist. This is the 203/EXEC class: units
+    #    reference %h/.local/bin/<x>, the .deb installs to /usr/local/bin, and
+    #    nothing bridged the two.
+    for unit in "$SYSTEMD_DIR"/ruos-*.service "$SYSTEMD_DIR"/ruvultra-*.service \
+                /usr/lib/systemd/user/ruos-*.service /usr/lib/systemd/user/ruvultra-*.service; do
+        [ -f "$unit" ] || continue
+        target="$(sed -n 's/^ExecStart=//p' "$unit" | head -1 | awk '{print $1}')"
+        target="${target/\%h/$HOME}"
+        case "$target" in
+            /bin/bash|/bin/sh|/usr/bin/env) continue ;;
+        esac
+        if [ ! -e "$target" ]; then
+            err "$(basename "$unit"): ExecStart target missing -> $target"
+            err "  this unit will fail with status=203/EXEC"
+            problems=$((problems + 1))
+        fi
+    done
+
+    # 2. Interpreters must exist. A script whose shebang points at a build
+    #    machine's virtualenv is just as dead as a missing binary, but fails
+    #    with a far more confusing error.
+    local f shebang interp
+    for f in "$BIN_DIR"/ruos-* "$BIN_DIR"/ruvultra-*; do
+        [ -f "$f" ] || continue
+        # Text check first: these globs also match compiled binaries, and
+        # reading NUL bytes into a command substitution is noisy and pointless.
+        head -c 2 "$f" | grep -q '^#!' 2>/dev/null || continue
+        shebang="$(head -c 200 "$f" | tr -d '\000' | head -1)"
+        case "$shebang" in
+            '#!'*)
+                interp="$(echo "${shebang#\#!}" | awk '{print $1}')"
+                if [ "$interp" != "/usr/bin/env" ] && [ ! -x "$interp" ]; then
+                    err "$(basename "$f"): shebang interpreter missing -> $interp"
+                    problems=$((problems + 1))
+                fi
+                ;;
+        esac
+    done
+
+    # 3. The brain ships 2.2 MB of curated memories in ruos-brain-base, but
+    #    installing that package only drops the .rvf on disk. If nothing has
+    #    imported it the brain answers every query from an empty index and
+    #    self-eval reports "avg score 0.0000" — which reads like a model
+    #    problem rather than an empty database.
+    local rvf brain_count
+    rvf="$(find_asset brain-base.rvf 2>/dev/null || true)"
+    brain_count="$(curl -s -m 3 "http://127.0.0.1:9876/brain/stats" 2>/dev/null \
+                   | sed -n 's/.*"memories"[: ]*\([0-9]*\).*/\1/p')"
+    if [ -n "$rvf" ] && [ "${brain_count:-0}" = "0" ]; then
+        warn "brain-base.rvf is installed at $rvf but the brain reports 0 memories"
+        warn "  search will score 0.0000 until it is imported"
+        problems=$((problems + 1))
+    fi
+
+    # 4. Nightly DPO sources ~/ml-env. Without it the timer runs every night and
+    #    fails every night, in the journal only.
+    if { [ -f "$SYSTEMD_DIR/ruos-agent-nightly.timer" ] \
+         || [ -f /usr/lib/systemd/user/ruos-agent-nightly.timer ]; } \
+       && [ ! -d "$HOME/ml-env" ]; then
+        warn "ruos-agent-nightly is enabled but ~/ml-env does not exist"
+        warn "  DPO training cannot run; mask the timer or create the venv"
+        problems=$((problems + 1))
+    fi
+
+    if [ "$problems" -eq 0 ]; then
+        log "Verification passed — all installed units can start"
+        return 0
+    fi
+    err "Verification found $problems problem(s) — see above"
+    return 1
+}
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 main() {
@@ -737,6 +895,8 @@ main() {
     else
         wizard
     fi
+
+    verify_install || true
 }
 
 main "$@"
