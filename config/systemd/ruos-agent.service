@@ -5,7 +5,7 @@ Wants=ruvultra-brain.service ruvultra-embedder.service
 
 [Service]
 Type=oneshot
-ExecStart=/home/ruvultra/.local/bin/ruos-agent
+ExecStart=%h/.local/bin/ruos-agent
 StandardOutput=journal
 StandardError=journal
 TimeoutStartSec=120

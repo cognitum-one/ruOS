@@ -2,9 +2,20 @@
 Description=ruos-agent heartbeat — every 5 minutes
 
 [Timer]
-OnBootSec=60
-OnUnitActiveSec=300
+# Use a calendar expression rather than OnBootSec=/OnUnitActiveSec=.
+#
+# The monotonic pair could not re-arm across a reboot: OnUnitActiveSec= has no
+# anchor until the service has been activated at least once in the current
+# runtime, so if the OnBootSec= trigger did not produce an activation the timer
+# settled into "active (elapsed)" with "Trigger: n/a" and the heartbeat stopped
+# for good — silently, because an elapsed timer is not a failed unit.
+#
+# Persistent= was also inert here: it only applies to OnCalendar=, so the stamp
+# file under ~/.local/share/systemd/timers was written but never acted on.
+# With OnCalendar= it now does what it says and catches up a missed window.
+OnCalendar=*:0/5
 Persistent=true
+AccuracySec=30s
 
 [Install]
 WantedBy=timers.target
