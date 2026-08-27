@@ -1,4 +1,4 @@
-#!/home/ruvultra/ml-env/bin/python3
+#!/usr/bin/env python3
 """ruos-llm-serve — local LLM inference server for ruos-agent.
 
 Serves Qwen2.5-3B-Instruct on CUDA via HuggingFace transformers.
@@ -9,10 +9,21 @@ Usage:
   ruos-llm-serve --model Qwen/Qwen2.5-3B-Instruct --port 8080
 """
 
-import argparse
-import json
 import os
 import sys
+
+# Prefer the ML virtualenv when it exists — torch and transformers live there —
+# but never bake it into the shebang. This file used to start with
+# "#!/home/<builder>/ml-env/bin/python3", which made it unrunnable on every
+# machine except the one that built the package: the kernel could not find the
+# interpreter, so the unit died at status=203/EXEC with no useful message.
+_VENV = os.path.expanduser("~/ml-env/bin/python3")
+if os.path.exists(_VENV) and not os.environ.get("RUOS_LLM_REEXEC"):
+    os.environ["RUOS_LLM_REEXEC"] = "1"
+    os.execv(_VENV, [_VENV, os.path.abspath(__file__)] + sys.argv[1:])
+
+import argparse
+import json
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
